@@ -227,6 +227,15 @@ def test_whisper_job_index_failure_marks_failed(client, monkeypatch):
     assert "yt-dlp exploded" in job["error"]
 
 
+def test_whisper_job_rejects_non_http_channel_url(client):
+    resp = client.post(
+        "/jobs/whisper",
+        json={"channel_url": "not-http"},
+        headers=AUTH_HEADERS,
+    )
+    assert resp.status_code == 400
+
+
 def test_job_not_found(client):
     resp = client.get("/jobs/nope", headers=AUTH_HEADERS)
     assert resp.status_code == 404

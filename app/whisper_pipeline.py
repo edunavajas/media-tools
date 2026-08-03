@@ -12,6 +12,7 @@ Adapted from tools/channel_index.py and tools/transcribe_channel.py:
 import json
 import logging
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -70,8 +71,10 @@ def index_channel(channel_url: str) -> list[dict[str, Any]]:
     """
     logger.info(f"Indexing channel: {channel_url}")
 
+    # Invoke yt-dlp through the current interpreter so we do not depend on
+    # the yt-dlp console script being on PATH (e.g. bare venvs).
     cmd = [
-        "yt-dlp",
+        sys.executable, "-m", "yt_dlp",
         "--flat-playlist",
         "--dump-single-json",
         "--skip-download",
@@ -95,7 +98,7 @@ def index_channel(channel_url: str) -> list[dict[str, Any]]:
             f"yt-dlp failed with exit code {e.returncode}: {e.stderr}"
         ) from e
     except FileNotFoundError as e:
-        raise RuntimeError("yt-dlp not found. Install it: pip install yt-dlp") from e
+        raise RuntimeError(f"could not invoke yt-dlp module: {e}") from e
 
     try:
         data = json.loads(result.stdout)
@@ -183,9 +186,10 @@ def download_audio(video_url: str, output_path: Path, cache_dir: Path) -> bool:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    # Use yt-dlp to download best audio
+    # Use yt-dlp to download best audio (via the current interpreter, so the
+    # yt-dlp console script does not need to be on PATH).
     cmd = [
-        "yt-dlp",
+        sys.executable, "-m", "yt_dlp",
         "-f", "bestaudio/best",
         "-x",  # Extract audio
         "--audio-format", "mp3",

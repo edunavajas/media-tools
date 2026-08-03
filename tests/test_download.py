@@ -87,9 +87,9 @@ def test_download_job_happy_path(client, monkeypatch):
 
 def test_download_rejects_non_http(client):
     resp = client.post(
-        "/download", json={"url": "ftp://example.com/x"}, headers=AUTH_HEADERS
+        "/download", json={"url": "file:///etc/passwd"}, headers=AUTH_HEADERS
     )
-    assert resp.status_code == 422
+    assert resp.status_code == 400
 
 
 def test_download_not_found(client):

@@ -71,6 +71,8 @@ def health() -> dict:
 @app.post("/jobs/whisper", response_model=JobCreated, status_code=202,
           dependencies=AUTH)
 def create_whisper_job(req: WhisperJobRequest) -> JobCreated:
+    if not req.channel_url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="only http/https URLs")
     store = get_store()
     job_id = store.create_job(
         "whisper",
@@ -126,7 +128,7 @@ def download_channel_json(job_id: str) -> FileResponse:
           dependencies=AUTH)
 def create_download_job(req: DownloadRequest) -> JobCreated:
     if not req.url.startswith(("http://", "https://")):
-        raise HTTPException(status_code=422, detail="only http/https URLs")
+        raise HTTPException(status_code=400, detail="only http/https URLs")
     store = get_store()
     job_id = store.create_job(
         "download", {"url": req.url}, config.data_dir() / "download" / "pending"
