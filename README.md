@@ -111,11 +111,12 @@ inline inside the test client.
 
 - Real whisper job against a local CPU speaches container
   (`ghcr.io/speaches-ai/speaches:latest-cpu`, model
-  `Systran/faster-whisper-small` — pull it first with
-  `POST /v1/models/Systran/faster-whisper-small`, speaches 404s on
-  unknown models) with `max_videos=2` on the public Odysee channel
-  `https://odysee.com/@minutephysics` → valid `channel.json` with
-  non-empty `transcript.text` and timestamped segments.
+  `Systran/faster-whisper-tiny` — pull it first with
+  `POST /v1/models/Systran/faster-whisper-tiny`, speaches 404s on
+  unknown models) with `max_videos=2` on NASA's public Twitch clips page
+  `https://www.twitch.tv/nasa/clips?filter=clips&range=all` (all clips
+  <= 60s) → valid `channel.json` with non-empty `transcript.text` and
+  timestamped segments.
   Note: YouTube media downloads are bot-check blocked from datacenter
   IPs (indexing works, `bestaudio` downloads get "Sign in to confirm
   you're not a bot"); the job then completes with partial failures in
