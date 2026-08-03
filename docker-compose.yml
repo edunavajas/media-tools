@@ -1,0 +1,29 @@
+# Optional: local development/testing with a CPU speaches instance.
+# In production the app only needs SPEACHES_BASE_URL pointing at your
+# existing speaches deployment.
+services:
+  app:
+    build: .
+    ports:
+      - "8001:8000"
+    environment:
+      MEDIA_TOOLS_TOKEN: ${MEDIA_TOOLS_TOKEN:-dev-token}
+      SPEACHES_BASE_URL: http://speaches:8000
+      SPEACHES_ENDPOINT: /v1/audio/transcriptions
+      SPEACHES_MODE: openai
+      SPEACHES_MODEL: Systran/faster-whisper-small
+      TIMEOUT_SECONDS: "1800"
+      DATA_DIR: /data
+      YTDLP_AUTOUPDATE: "0"
+    volumes:
+      - media-tools-data:/data
+    depends_on:
+      - speaches
+
+  speaches:
+    image: ghcr.io/speaches-ai/speaches:latest-cpu
+    ports:
+      - "8000:8000"
+
+volumes:
+  media-tools-data:
