@@ -53,12 +53,13 @@ def run_whisper_job(store: JobStore, job_id: str) -> None:
         videos = whisper_pipeline.index_channel(params["channel_url"])
         if max_videos:
             videos = videos[:max_videos]
-        if not videos:
-            raise RuntimeError("no videos found in channel")
-
         store.update_progress(
             job_id, total=len(videos), done=0, failed=[], current=None
         )
+        if not videos:
+            build_channel_json(output_dir, [], language)
+            store.set_status(job_id, "done", finished=True)
+            return
 
         transcription = _transcription_config(language)
         cache_dir = output_dir / ".cache"
@@ -113,7 +114,11 @@ def run_whisper_job(store: JobStore, job_id: str) -> None:
             if not ok and error
         }
         build_channel_json(output_dir, videos, language, errors=errors)
-        store.set_status(job_id, "done", finished=True)
+        if videos and all(not ok for _, ok, _ in results):
+            error = next(iter(errors.values()), "all videos failed")
+            store.set_status(job_id, "failed", error=error, finished=True)
+        else:
+            store.set_status(job_id, "done", finished=True)
     except Exception as e:
         logger.exception(f"whisper job {job_id} failed")
         try:

@@ -11,16 +11,37 @@ Adapted from tools/channel_index.py and tools/transcribe_channel.py:
 """
 import json
 import logging
+import re
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
+from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+_YOUTUBE_HOSTS = {
+    "youtube.com",
+    "www.youtube.com",
+    "m.youtube.com",
+    "music.youtube.com",
+}
+_VIDEO_PATHS = {"shorts", "live", "embed", "v", "clip"}
+_NON_VIDEO_PATHS = {
+    "channel",
+    "c",
+    "user",
+    "playlist",
+    "feed",
+    "hashtag",
+    "results",
+}
+_download_state = threading.local()
 
 
 @dataclass
@@ -54,6 +75,95 @@ def sanitize_filename(filename: str) -> str:
     return filename
 
 
+def normalize_channel_url(channel_url: str) -> str:
+    """Point YouTube channel roots at the videos tab without touching URLs."""
+    parsed = urlsplit(channel_url)
+    if (parsed.hostname or "").lower() not in _YOUTUBE_HOSTS:
+        return channel_url
+
+    segments = [segment for segment in parsed.path.split("/") if segment]
+    is_channel_root = (
+        len(segments) == 1 and segments[0].startswith("@")
+    ) or (
+        len(segments) == 2 and segments[0] in {"channel", "c", "user"}
+    )
+    if not is_channel_root:
+        return channel_url
+
+    normalized_path = "/" + "/".join((*segments, "videos"))
+    return urlunsplit((
+        parsed.scheme,
+        parsed.netloc,
+        normalized_path,
+        parsed.query,
+        parsed.fragment,
+    ))
+
+
+def _is_youtube_video_url(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    parsed = urlsplit(value)
+    host = (parsed.hostname or "").lower()
+    segments = [segment for segment in parsed.path.split("/") if segment]
+    if host == "youtu.be":
+        return bool(segments)
+    if host not in _YOUTUBE_HOSTS:
+        return False
+    if parsed.path.rstrip("/") == "/watch":
+        return bool(parse_qs(parsed.query).get("v"))
+    return bool(segments and segments[0] in _VIDEO_PATHS and len(segments) > 1)
+
+
+def _is_clearly_non_video_entry(entry: dict[str, Any]) -> bool:
+    entry_type = str(entry.get("_type") or "").lower()
+    if entry_type in {"channel", "playlist", "collection"}:
+        return True
+
+    urls = [
+        entry.get("webpage_url"),
+        entry.get("original_url"),
+        entry.get("url"),
+    ]
+    if any(_is_youtube_video_url(value) for value in urls):
+        return False
+
+    for value in urls:
+        if not isinstance(value, str):
+            continue
+        parsed = urlsplit(value)
+        host = (parsed.hostname or "").lower()
+        if host not in _YOUTUBE_HOSTS and host != "youtu.be":
+            continue
+        segments = [segment for segment in parsed.path.split("/") if segment]
+        if not segments:
+            return True
+        if parsed.path.rstrip("/") == "/watch":
+            return True
+        if segments[0].startswith("@") or segments[0] in _NON_VIDEO_PATHS:
+            return True
+        if segments[0] in _VIDEO_PATHS and len(segments) == 1:
+            return True
+    return False
+
+
+def _summarize_error(error: Any, limit: int = 500) -> str:
+    """Keep yt-dlp errors useful without storing logs, URLs, or credentials."""
+    text = str(error or "")
+    text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+    text = re.sub(r"https?://\S+", "<url>", text)
+    text = re.sub(
+        r"(?i)\b(cookie|authorization|token|password|secret)(?:\s*[=:]\s*)\S+",
+        r"\1=<redacted>",
+        text,
+    )
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    summary = " ".join(lines[-3:])
+    if len(summary) > limit:
+        return summary[: limit - 3].rstrip() + "..."
+    return summary
+
+
 def index_channel(channel_url: str) -> list[dict[str, Any]]:
     """
     Index all videos from a YouTube channel using yt-dlp.
@@ -69,6 +179,7 @@ def index_channel(channel_url: str) -> list[dict[str, Any]]:
     Raises:
         RuntimeError: if yt-dlp fails or its output cannot be parsed.
     """
+    channel_url = normalize_channel_url(channel_url)
     logger.info(f"Indexing channel: {channel_url}")
 
     # Invoke yt-dlp through the current interpreter so we do not depend on
@@ -94,8 +205,9 @@ def index_channel(channel_url: str) -> list[dict[str, Any]]:
             encoding="utf-8",
         )
     except subprocess.CalledProcessError as e:
+        detail = _summarize_error(e.stderr) or f"exit code {e.returncode}"
         raise RuntimeError(
-            f"yt-dlp failed with exit code {e.returncode}: {e.stderr}"
+            f"yt-dlp failed: {detail}"
         ) from e
     except FileNotFoundError as e:
         raise RuntimeError(f"could not invoke yt-dlp module: {e}") from e
@@ -116,21 +228,52 @@ def index_channel(channel_url: str) -> list[dict[str, Any]]:
     # playlist-level metadata.
     default_channel = data.get("channel") or data.get("uploader")
     default_channel_id = data.get("channel_id") or data.get("uploader_id")
+    channel_ids = {
+        str(value)
+        for value in (default_channel_id,)
+        if value
+    }
+    channel_ids.update(
+        str(value)
+        for entry in entries
+        if isinstance(entry, dict)
+        for value in (entry.get("channel_id"), entry.get("uploader_id"))
+        if value
+    )
 
     videos: list[dict[str, Any]] = []
     for entry in entries:
-        if not entry:  # Skip None entries
+        if not isinstance(entry, dict):
+            # Skip None and other non-entry values from partial extractor output.
             continue
 
         video_id = entry.get("id")
         if not video_id:
             logger.warning("Skipping entry without ID")
             continue
+        video_id = str(video_id)
+        if video_id in channel_ids or _is_clearly_non_video_entry(entry):
+            logger.debug("Skipping non-video entry: %s", video_id)
+            continue
+
+        entry_urls = [
+            entry.get("webpage_url"),
+            entry.get("original_url"),
+            entry.get("url"),
+        ]
+        video_url = next(
+            (value for value in entry_urls if _is_youtube_video_url(value)),
+            None,
+        )
+        if not video_url:
+            raw_url = entry.get("url")
+            video_url = raw_url if isinstance(raw_url, str) and "://" in raw_url else None
+        video_url = video_url or f"https://www.youtube.com/watch?v={video_id}"
 
         videos.append({
             "video_id": video_id,
             "title": entry.get("title", "Unknown"),
-            "url": entry.get("url") or f"https://www.youtube.com/watch?v={video_id}",
+            "url": video_url,
             "upload_date": entry.get("upload_date"),
             "duration": entry.get("duration"),
             "view_count": entry.get("view_count"),
@@ -179,6 +322,7 @@ def download_audio(video_url: str, output_path: Path, cache_dir: Path) -> bool:
     Returns:
         True if successful, False otherwise
     """
+    _download_state.error = None
     if output_path.exists():
         logger.debug(f"Audio already exists: {output_path}")
         return True
@@ -221,14 +365,19 @@ def download_audio(video_url: str, output_path: Path, cache_dir: Path) -> bool:
             logger.debug(f"Downloaded: {output_path}")
             return True
         else:
-            logger.error(f"Download completed but file not found: {output_path}")
+            _download_state.error = "download completed but file was not found"
+            logger.error(_download_state.error)
             return False
 
     except subprocess.CalledProcessError as e:
-        logger.error(f"Download failed: {e.stderr}")
+        detail = _summarize_error(e.stderr) or f"exit code {e.returncode}"
+        _download_state.error = detail
+        logger.error("Download failed: %s", detail)
         return False
     except Exception as e:
-        logger.error(f"Download error: {e}")
+        detail = _summarize_error(e) or "unknown download error"
+        _download_state.error = detail
+        logger.error("Download error: %s", detail)
         return False
 
 
@@ -531,9 +680,14 @@ def process_video(
             time.sleep(retry_backoff * attempt)
 
         # Download
+        _download_state.error = None
         if not download_audio(task.url, audio_path, cache_dir):
             if attempt == retries - 1:
-                return _finish(False, "Audio download failed")
+                error = "Audio download failed"
+                detail = getattr(_download_state, "error", None)
+                if detail:
+                    error = f"{error}: {detail}"
+                return _finish(False, error)
             continue
 
         # Transcribe

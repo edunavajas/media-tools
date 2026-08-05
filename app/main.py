@@ -116,7 +116,7 @@ def download_channel_json(job_id: str) -> FileResponse:
         raise HTTPException(status_code=409, detail="job is still running")
     channel_json = Path(job["output_dir"]) / "channel.json"
     if not channel_json.exists():
-        raise HTTPException(status_code=404, detail="channel.json not found")
+        raise HTTPException(status_code=410, detail="channel.json no longer exists")
     return FileResponse(channel_json, media_type="application/json",
                         filename="channel.json")
 
