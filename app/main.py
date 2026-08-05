@@ -3,10 +3,11 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote
 
 import yt_dlp
 from fastapi import Depends, FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 
 from app import config, workers
 from app.auth import require_token
@@ -46,6 +47,7 @@ async def lifespan(app: FastAPI):
     recovered = _store.recover_interrupted_jobs()
     if recovered:
         logger.warning(f"Recovered {recovered} interrupted jobs -> failed")
+    workers.cleanup_expired_jobs(_store)
     _cleaner = workers.TtlCleaner(_store)
     _cleaner.start()
     yield
@@ -112,11 +114,13 @@ def download_channel_json(job_id: str) -> FileResponse:
         raise HTTPException(status_code=404, detail="job not found")
     if job["status"] == "expired":
         raise HTTPException(status_code=410, detail="job expired and files deleted")
+    if job["status"] == "failed":
+        raise HTTPException(status_code=404, detail="job failed; files unavailable")
     if job["status"] in ("queued", "running"):
         raise HTTPException(status_code=409, detail="job is still running")
     channel_json = Path(job["output_dir"]) / "channel.json"
     if not channel_json.exists():
-        raise HTTPException(status_code=410, detail="channel.json no longer exists")
+        raise HTTPException(status_code=404, detail="channel.json not found")
     return FileResponse(channel_json, media_type="application/json",
                         filename="channel.json")
 
@@ -167,16 +171,41 @@ def get_download_job(job_id: str) -> dict:
 
 
 @app.get("/download/{job_id}/file", dependencies=AUTH)
-def get_download_file(job_id: str) -> FileResponse:
+def get_download_file(job_id: str) -> StreamingResponse:
     job = _get_download_job(job_id)
     if job["status"] == "expired":
         raise HTTPException(status_code=410, detail="job expired and files deleted")
     if job["status"] in ("queued", "running"):
         raise HTTPException(status_code=409, detail="download is still running")
     output_dir = Path(job["output_dir"])
-    mp4s = sorted(output_dir.glob("*.mp4")) if output_dir.exists() else []
-    if not mp4s:
+    mp4_path, reason = workers.begin_download(get_store(), job_id)
+    if mp4_path is None:
+        if reason == "busy":
+            raise HTTPException(status_code=409, detail="download already in progress")
+        if reason in ("queued", "running"):
+            raise HTTPException(status_code=409, detail="download is still running")
+        if reason == "expired":
+            raise HTTPException(status_code=410, detail="job expired and files deleted")
+        if reason == "failed":
+            raise HTTPException(status_code=404, detail="job failed; files unavailable")
         raise HTTPException(status_code=404, detail="downloaded file not found")
-    return FileResponse(
-        mp4s[0], media_type="video/mp4", filename=mp4s[0].name
+
+    def stream_file():
+        completed = False
+        try:
+            with mp4_path.open("rb") as file:
+                while chunk := file.read(1024 * 1024):
+                    yield chunk
+            completed = True
+        finally:
+            workers.finish_download(job_id, output_dir, completed)
+
+    return StreamingResponse(
+        stream_file(),
+        media_type="video/mp4",
+        headers={
+            "Content-Disposition": (
+                f"attachment; filename*=UTF-8''{quote(mp4_path.name)}"
+            )
+        },
     )

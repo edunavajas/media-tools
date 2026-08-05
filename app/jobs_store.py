@@ -159,24 +159,33 @@ class JobStore:
             self._conn.commit()
             return cur.rowcount
 
-    def expire_finished_jobs(self, cutoff_iso: str) -> list[dict[str, Any]]:
+    def expire_finished_jobs(
+        self, cutoff_iso: str, exclude_ids: Optional[set[str]] = None
+    ) -> list[dict[str, Any]]:
         """Mark done|failed jobs finished before cutoff as expired.
 
         Returns the expired rows (with output_dir) so the caller can delete
         the on-disk artifacts.
         """
         now = _utcnow()
+        clauses = [
+            "status IN ('done', 'failed')",
+            "finished_at IS NOT NULL",
+            "finished_at < ?",
+        ]
+        args: list[Any] = [cutoff_iso]
+        if exclude_ids:
+            placeholders = ", ".join("?" for _ in exclude_ids)
+            clauses.append(f"id NOT IN ({placeholders})")
+            args.extend(exclude_ids)
+        where = " AND ".join(clauses)
         with self._lock:
             rows = self._conn.execute(
-                "SELECT * FROM jobs WHERE status IN ('done', 'failed')"
-                " AND finished_at IS NOT NULL AND finished_at < ?",
-                (cutoff_iso,),
+                f"SELECT * FROM jobs WHERE {where}", args
             ).fetchall()
             self._conn.execute(
-                "UPDATE jobs SET status = 'expired', updated_at = ?"
-                " WHERE status IN ('done', 'failed')"
-                " AND finished_at IS NOT NULL AND finished_at < ?",
-                (now, cutoff_iso),
+                f"UPDATE jobs SET status = 'expired', updated_at = ? WHERE {where}",
+                [now, *args],
             )
             self._conn.commit()
         return [self._row_to_dict(r) for r in rows]

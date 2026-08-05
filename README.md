@@ -51,8 +51,11 @@ All endpoints require `Authorization: Bearer $MEDIA_TOOLS_TOKEN` except
 
 ### Job lifecycle
 
-`queued → running → done|failed`, and `done|failed → expired` 24h after
-`finished_at` (a daemon cleaner thread deletes the output dir hourly).
+`queued → running → done|failed`, and `done|failed → expired` 2h after
+`finished_at` (the cleaner runs at startup and every minute). A completed
+mp4 is deleted after its download stream reaches EOF; interrupted streams keep
+the file for the TTL safety window. Whisper exports remain available until
+that same TTL.
 On startup, jobs left in `queued|running` are marked `failed` with
 `"service restarted"`.
 
@@ -74,6 +77,10 @@ See `.env.example`. Highlights:
 - `DATA_DIR=/data` (SQLite `jobs.db` + job outputs)
 - `YTDLP_AUTOUPDATE=1` upgrades yt-dlp at container start (YouTube
   extraction breaks often; the pinned version is in `requirements.txt`)
+- `YTDLP_COOKIES_FILE` optionally points to a mounted Netscape-format cookies
+  file; keep it in a Coolify secret/file mount and never commit it
+- `YTDLP_PROXY` optionally configures the proxy used by both download and
+  Whisper yt-dlp calls
 - `WORKER_MODE=sync` runs jobs inline (used by the test suite)
 
 ## Run

@@ -6,6 +6,8 @@ from typing import Any, Callable, Optional
 
 import yt_dlp
 
+from app import config
+
 logger = logging.getLogger(__name__)
 
 DOWNLOAD_FORMAT = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
@@ -108,6 +110,7 @@ def download_video(
         "no_warnings": True,
         "progress_hooks": [_hook],
     }
+    ydl_opts.update(config.ytdlp_options())
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:

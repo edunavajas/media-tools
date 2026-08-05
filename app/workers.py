@@ -21,8 +21,11 @@ logger = logging.getLogger(__name__)
 whisper_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="whisper")
 download_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="download")
 
-JOB_TTL_HOURS = 24
-CLEANER_INTERVAL_SECONDS = 3600
+JOB_TTL_HOURS = 2
+CLEANER_INTERVAL_SECONDS = 60
+
+_artifact_lock = threading.Lock()
+_active_downloads: set[str] = set()
 
 
 def _transcription_config(language: str) -> TranscriptionConfig:
@@ -38,6 +41,7 @@ def _transcription_config(language: str) -> TranscriptionConfig:
 
 def run_whisper_job(store: JobStore, job_id: str) -> None:
     """Run a whisper job end to end. Never raises: failures mark the job."""
+    output_dir: Optional[Path] = None
     try:
         job = store.get_job(job_id)
         if job is None:
@@ -53,13 +57,12 @@ def run_whisper_job(store: JobStore, job_id: str) -> None:
         videos = whisper_pipeline.index_channel(params["channel_url"])
         if max_videos:
             videos = videos[:max_videos]
+        if not videos:
+            raise RuntimeError("no videos found in channel")
+
         store.update_progress(
             job_id, total=len(videos), done=0, failed=[], current=None
         )
-        if not videos:
-            build_channel_json(output_dir, [], language)
-            store.set_status(job_id, "done", finished=True)
-            return
 
         transcription = _transcription_config(language)
         cache_dir = output_dir / ".cache"
@@ -113,14 +116,18 @@ def run_whisper_job(store: JobStore, job_id: str) -> None:
             for video_id, ok, error in results
             if not ok and error
         }
+        if not any(ok for _, ok, _ in results):
+            details = "; ".join(
+                f"{video_id}: {error or 'unknown error'}"
+                for video_id, _, error in results
+            )
+            raise RuntimeError(f"all whisper videos failed: {details}")
         build_channel_json(output_dir, videos, language, errors=errors)
-        if videos and all(not ok for _, ok, _ in results):
-            error = next(iter(errors.values()), "all videos failed")
-            store.set_status(job_id, "failed", error=error, finished=True)
-        else:
-            store.set_status(job_id, "done", finished=True)
+        store.set_status(job_id, "done", finished=True)
     except Exception as e:
         logger.exception(f"whisper job {job_id} failed")
+        if output_dir is not None:
+            shutil.rmtree(output_dir, ignore_errors=True)
         try:
             store.set_status(job_id, "failed", error=str(e), finished=True)
         except Exception:
@@ -129,6 +136,7 @@ def run_whisper_job(store: JobStore, job_id: str) -> None:
 
 def run_download_job(store: JobStore, job_id: str) -> None:
     """Run a download job end to end. Never raises: failures mark the job."""
+    output_dir: Optional[Path] = None
     try:
         job = store.get_job(job_id)
         if job is None:
@@ -173,6 +181,8 @@ def run_download_job(store: JobStore, job_id: str) -> None:
         store.set_status(job_id, "done", finished=True)
     except Exception as e:
         logger.exception(f"download job {job_id} failed")
+        if output_dir is not None:
+            shutil.rmtree(output_dir, ignore_errors=True)
         try:
             store.set_status(job_id, "failed", error=str(e), finished=True)
         except Exception:
@@ -189,17 +199,48 @@ def submit(store: JobStore, job_id: str, kind: str) -> None:
         pool.submit(runner, store, job_id)
 
 
+def begin_download(
+    store: JobStore, job_id: str
+) -> tuple[Optional[Path], str]:
+    """Reserve a completed download while its file is streamed to one client."""
+    with _artifact_lock:
+        job = store.get_job(job_id)
+        if job is None or job["kind"] != "download":
+            return None, "not_found"
+        if job["status"] != "done":
+            return None, job["status"]
+        if job_id in _active_downloads:
+            return None, "busy"
+        output_dir = Path(job["output_dir"])
+        mp4s = sorted(output_dir.glob("*.mp4")) if output_dir.exists() else []
+        if not mp4s:
+            return None, "missing"
+        _active_downloads.add(job_id)
+        return mp4s[0], "ready"
+
+
+def finish_download(job_id: str, output_dir: Path, completed: bool) -> None:
+    """Release a download and remove its artifact only after EOF."""
+    with _artifact_lock:
+        _active_downloads.discard(job_id)
+        if completed:
+            shutil.rmtree(output_dir, ignore_errors=True)
+
+
 def cleanup_expired_jobs(store: JobStore, ttl_hours: int = JOB_TTL_HOURS) -> int:
     """Expire done|failed jobs older than the TTL and delete their files."""
     cutoff = (
         datetime.now(timezone.utc) - timedelta(hours=ttl_hours)
     ).isoformat()
-    expired = store.expire_finished_jobs(cutoff)
-    for job in expired:
-        output_dir = Path(job["output_dir"])
-        if output_dir.exists():
-            shutil.rmtree(output_dir, ignore_errors=True)
-            logger.info(f"Expired job {job['id']}: removed {output_dir}")
+    with _artifact_lock:
+        expired = store.expire_finished_jobs(
+            cutoff, exclude_ids=set(_active_downloads)
+        )
+        for job in expired:
+            output_dir = Path(job["output_dir"])
+            if output_dir.exists():
+                shutil.rmtree(output_dir, ignore_errors=True)
+                logger.info(f"Expired job {job['id']}: removed {output_dir}")
     return len(expired)
 
 

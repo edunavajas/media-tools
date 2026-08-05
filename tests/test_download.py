@@ -1,4 +1,5 @@
 """Download job flow with a fake YoutubeDL, plus TTL expiry."""
+import asyncio
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -83,6 +84,9 @@ def test_download_job_happy_path(client, monkeypatch):
     resp = client.get(f"/download/{job_id}/file", headers=AUTH_HEADERS)
     assert resp.status_code == 200
     assert resp.content == FAKE_FILE_BYTES
+    assert client.get(
+        f"/download/{job_id}/file", headers=AUTH_HEADERS
+    ).status_code == 404
 
 
 def test_download_rejects_non_http(client):
@@ -117,12 +121,9 @@ def test_ttl_expiry_makes_file_gone(client, monkeypatch):
         headers=AUTH_HEADERS,
     )
     job_id = resp.json()["job_id"]
-    assert client.get(f"/download/{job_id}/file",
-                      headers=AUTH_HEADERS).status_code == 200
-
-    # Forge finished_at 25h in the past and run the cleaner.
+    # Forge finished_at 3h in the past and run the cleaner.
     store = main.get_store()
-    old = (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat()
+    old = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
     with store._lock:
         store._conn.execute(
             "UPDATE jobs SET finished_at = ? WHERE id = ?", (old, job_id)
@@ -141,3 +142,40 @@ def test_ttl_expiry_makes_file_gone(client, monkeypatch):
 
     resp = client.get(f"/download/{job_id}/file", headers=AUTH_HEADERS)
     assert resp.status_code == 410
+
+
+def test_ttl_cleaner_interval_is_bounded():
+    assert 0 < workers.CLEANER_INTERVAL_SECONDS <= 60
+
+
+def test_download_keeps_file_when_stream_is_interrupted(client, monkeypatch):
+    _mock_ydl(monkeypatch)
+    job_id = client.post(
+        "/download",
+        json={"url": "https://example.com/watch?v=abc123"},
+        headers=AUTH_HEADERS,
+    ).json()["job_id"]
+    store = main.get_store()
+    output_dir = Path(store.get_job(job_id)["output_dir"])
+    response = main.get_download_file(job_id)
+    stream = response.body_iterator
+    asyncio.run(stream.__anext__())
+    asyncio.run(stream.aclose())
+    assert next(output_dir.glob("*.mp4")).exists()
+    assert output_dir.exists()
+
+
+def test_ytdlp_options_are_opt_in(monkeypatch, tmp_path):
+    monkeypatch.setenv("YTDLP_COOKIES_FILE", "/run/secrets/youtube-cookies.txt")
+    monkeypatch.setenv("YTDLP_PROXY", "http://proxy.test:8080")
+    captured = {}
+
+    class CapturingYoutubeDL(FakeYoutubeDL):
+        def __init__(self, opts):
+            captured.update(opts)
+            super().__init__(opts)
+
+    monkeypatch.setattr(downloader.yt_dlp, "YoutubeDL", CapturingYoutubeDL)
+    downloader.download_video("https://example.com/watch?v=abc123", tmp_path)
+    assert captured["cookiefile"] == "/run/secrets/youtube-cookies.txt"
+    assert captured["proxy"] == "http://proxy.test:8080"

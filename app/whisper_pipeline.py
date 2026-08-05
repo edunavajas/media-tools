@@ -14,7 +14,6 @@ import logging
 import re
 import subprocess
 import sys
-import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,25 +22,9 @@ from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 import httpx
 
-logger = logging.getLogger(__name__)
+from app import config
 
-_YOUTUBE_HOSTS = {
-    "youtube.com",
-    "www.youtube.com",
-    "m.youtube.com",
-    "music.youtube.com",
-}
-_VIDEO_PATHS = {"shorts", "live", "embed", "v", "clip"}
-_NON_VIDEO_PATHS = {
-    "channel",
-    "c",
-    "user",
-    "playlist",
-    "feed",
-    "hashtag",
-    "results",
-}
-_download_state = threading.local()
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -73,6 +56,24 @@ def sanitize_filename(filename: str) -> str:
     if len(filename) > 200:
         filename = filename[:200]
     return filename
+
+
+_YOUTUBE_HOSTS = {
+    "youtube.com",
+    "www.youtube.com",
+    "m.youtube.com",
+    "music.youtube.com",
+}
+_VIDEO_PATHS = {"shorts", "live", "embed", "v", "clip"}
+_NON_VIDEO_PATHS = {
+    "channel",
+    "c",
+    "user",
+    "playlist",
+    "feed",
+    "hashtag",
+    "results",
+}
 
 
 def normalize_channel_url(channel_url: str) -> str:
@@ -191,10 +192,11 @@ def index_channel(channel_url: str) -> list[dict[str, Any]]:
         "--skip-download",
         "--no-warnings",
         "--extractor-args", "youtube:skip=authcheck",
+        *config.ytdlp_cli_args(),
         channel_url,
     ]
 
-    logger.debug(f"Running: {' '.join(cmd)}")
+    logger.debug("Running yt-dlp channel index")
 
     try:
         result = subprocess.run(
@@ -205,10 +207,8 @@ def index_channel(channel_url: str) -> list[dict[str, Any]]:
             encoding="utf-8",
         )
     except subprocess.CalledProcessError as e:
-        detail = _summarize_error(e.stderr) or f"exit code {e.returncode}"
-        raise RuntimeError(
-            f"yt-dlp failed: {detail}"
-        ) from e
+        detail = _summarize_error(e.stderr or e.stdout) or f"exit code {e.returncode}"
+        raise RuntimeError(f"yt-dlp failed: {detail}") from e
     except FileNotFoundError as e:
         raise RuntimeError(f"could not invoke yt-dlp module: {e}") from e
 
@@ -310,7 +310,7 @@ def load_videos(input_path: Path) -> list[dict[str, Any]]:
     return videos
 
 
-def download_audio(video_url: str, output_path: Path, cache_dir: Path) -> bool:
+def download_audio(video_url: str, output_path: Path, cache_dir: Path) -> bool | str:
     """
     Download audio from YouTube video using yt-dlp.
 
@@ -320,9 +320,8 @@ def download_audio(video_url: str, output_path: Path, cache_dir: Path) -> bool:
         cache_dir: Cache directory for yt-dlp
 
     Returns:
-        True if successful, False otherwise
+        True if successful, otherwise a useful yt-dlp error string
     """
-    _download_state.error = None
     if output_path.exists():
         logger.debug(f"Audio already exists: {output_path}")
         return True
@@ -342,10 +341,11 @@ def download_audio(video_url: str, output_path: Path, cache_dir: Path) -> bool:
         "--cache-dir", str(cache_dir),
         "--no-warnings",
         "--no-playlist",
+        *config.ytdlp_cli_args(),
         video_url,
     ]
 
-    logger.debug(f"Downloading audio: {' '.join(cmd)}")
+    logger.debug("Downloading audio with yt-dlp")
 
     try:
         subprocess.run(
@@ -365,20 +365,19 @@ def download_audio(video_url: str, output_path: Path, cache_dir: Path) -> bool:
             logger.debug(f"Downloaded: {output_path}")
             return True
         else:
-            _download_state.error = "download completed but file was not found"
-            logger.error(_download_state.error)
-            return False
+            logger.error(f"Download completed but file not found: {output_path}")
+            return "download completed but audio file was not found"
 
     except subprocess.CalledProcessError as e:
-        detail = _summarize_error(e.stderr) or f"exit code {e.returncode}"
-        _download_state.error = detail
-        logger.error("Download failed: %s", detail)
-        return False
+        detail = _summarize_error(e.stderr or e.stdout) or f"exit code {e.returncode}"
+        error = f"Audio download failed: {detail}"
+        logger.error(error)
+        return error
     except Exception as e:
         detail = _summarize_error(e) or "unknown download error"
-        _download_state.error = detail
-        logger.error("Download error: %s", detail)
-        return False
+        error = f"Audio download error: {detail}"
+        logger.error(error)
+        return error
 
 
 def _apply_language_hint(data: dict[str, str], language: str) -> None:
@@ -680,13 +679,14 @@ def process_video(
             time.sleep(retry_backoff * attempt)
 
         # Download
-        _download_state.error = None
-        if not download_audio(task.url, audio_path, cache_dir):
+        download_result = download_audio(task.url, audio_path, cache_dir)
+        if download_result is not True:
             if attempt == retries - 1:
-                error = "Audio download failed"
-                detail = getattr(_download_state, "error", None)
-                if detail:
-                    error = f"{error}: {detail}"
+                error = (
+                    download_result
+                    if isinstance(download_result, str)
+                    else "Audio download failed"
+                )
                 return _finish(False, error)
             continue
 

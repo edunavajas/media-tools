@@ -46,3 +46,27 @@ def worker_mode() -> str:
 
 def ytdlp_autoupdate() -> bool:
     return os.environ.get("YTDLP_AUTOUPDATE", "0") == "1"
+
+
+def ytdlp_options() -> dict[str, str]:
+    """Return optional yt-dlp Python API options from the environment."""
+    options: dict[str, str] = {}
+    cookies_file = os.environ.get("YTDLP_COOKIES_FILE")
+    proxy = os.environ.get("YTDLP_PROXY")
+    if cookies_file:
+        options["cookiefile"] = cookies_file
+    if proxy:
+        options["proxy"] = proxy
+    return options
+
+
+def ytdlp_cli_args() -> list[str]:
+    """Return optional yt-dlp CLI arguments without exposing their values."""
+    args: list[str] = []
+    cookies_file = os.environ.get("YTDLP_COOKIES_FILE")
+    proxy = os.environ.get("YTDLP_PROXY")
+    if cookies_file:
+        args.extend(["--cookies", cookies_file])
+    if proxy:
+        args.extend(["--proxy", proxy])
+    return args

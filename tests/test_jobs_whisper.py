@@ -1,7 +1,6 @@
 """Whisper job flow with mocked indexing/download/transcription (no network)."""
 import json
 import subprocess
-from pathlib import Path
 
 import httpx
 
@@ -183,55 +182,15 @@ def test_index_channel_normalizes_root_and_filters_channel_tabs(monkeypatch):
     assert captured["cmd"][-1] == "https://www.youtube.com/@test/videos"
     assert [video["video_id"] for video in videos] == ["vid1"]
     assert videos[0]["url"] == "https://www.youtube.com/watch?v=vid1"
-    assert (
-        whisper_pipeline.normalize_channel_url(
-            "https://www.youtube.com/channel/UCtest"
-        )
-        == "https://www.youtube.com/channel/UCtest/videos"
-    )
+    assert whisper_pipeline.normalize_channel_url(
+        "https://www.youtube.com/channel/UCtest"
+    ) == "https://www.youtube.com/channel/UCtest/videos"
     assert whisper_pipeline.normalize_channel_url(
         "https://www.youtube.com/@test/shorts"
     ) == "https://www.youtube.com/@test/shorts"
     assert whisper_pipeline.normalize_channel_url(
         "https://example.com/channel/UCtest"
     ) == "https://example.com/channel/UCtest"
-
-
-def test_whisper_job_all_failures_is_failed_but_json_downloadable(client, monkeypatch):
-    monkeypatch.setattr(
-        whisper_pipeline, "index_channel", lambda url: list(INDEXED_VIDEOS)
-    )
-    monkeypatch.setattr(
-        whisper_pipeline, "download_audio", lambda url, output, cache: False
-    )
-    monkeypatch.setattr(whisper_pipeline.time, "sleep", lambda s: None)
-
-    resp = client.post(
-        "/jobs/whisper",
-        json={"channel_url": "https://www.youtube.com/@test"},
-        headers=AUTH_HEADERS,
-    )
-    job_id = resp.json()["job_id"]
-    job = client.get(f"/jobs/{job_id}", headers=AUTH_HEADERS).json()
-
-    assert job["status"] == "failed"
-    assert job["progress"]["done"] == len(INDEXED_VIDEOS)
-    assert len(job["progress"]["failed"]) == len(INDEXED_VIDEOS)
-
-    channel_json = Path(job["output_dir"]) / "channel.json"
-    assert channel_json.exists()
-    download = client.get(f"/jobs/{job_id}/download", headers=AUTH_HEADERS)
-    assert download.status_code == 200
-    export = ChannelExport(**download.json())
-    assert len(export.videos) == len(INDEXED_VIDEOS)
-    assert all(video.transcript is None for video in export.videos)
-    assert all(
-        video.error == "Audio download failed" for video in export.videos
-    )
-
-    channel_json.unlink()
-    missing = client.get(f"/jobs/{job_id}/download", headers=AUTH_HEADERS)
-    assert missing.status_code == 410
 
 
 def test_audio_download_error_keeps_yt_dlp_cause_bounded(tmp_path, monkeypatch):
@@ -243,7 +202,6 @@ def test_audio_download_error_keeps_yt_dlp_cause_bounded(tmp_path, monkeypatch):
         )
 
     monkeypatch.setattr(whisper_pipeline.subprocess, "run", fake_run)
-    monkeypatch.setattr(whisper_pipeline.time, "sleep", lambda s: None)
     task = whisper_pipeline.VideoTask(
         video_id="vid1",
         title="Video",
@@ -356,6 +314,28 @@ def test_whisper_job_index_failure_marks_failed(client, monkeypatch):
     job = client.get(f"/jobs/{job_id}", headers=AUTH_HEADERS).json()
     assert job["status"] == "failed"
     assert "yt-dlp exploded" in job["error"]
+
+
+def test_whisper_job_all_video_failures_marks_failed(client, monkeypatch):
+    _mock_pipeline(monkeypatch, fail_video_id="vid1")
+    monkeypatch.setattr(
+        whisper_pipeline,
+        "download_audio",
+        lambda video_url, output_path, cache_dir: "yt-dlp: Sign in to confirm",
+    )
+
+    job_id = client.post(
+        "/jobs/whisper",
+        json={"channel_url": "https://www.youtube.com/@test/videos"},
+        headers=AUTH_HEADERS,
+    ).json()["job_id"]
+    job = client.get(f"/jobs/{job_id}", headers=AUTH_HEADERS).json()
+    assert job["status"] == "failed"
+    assert "all whisper videos failed" in job["error"]
+    assert "Sign in to confirm" in job["error"]
+    assert client.get(
+        f"/jobs/{job_id}/download", headers=AUTH_HEADERS
+    ).status_code == 404
 
 
 def test_whisper_job_rejects_non_http_channel_url(client):
