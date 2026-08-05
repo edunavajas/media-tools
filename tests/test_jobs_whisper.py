@@ -180,6 +180,8 @@ def test_index_channel_normalizes_root_and_filters_channel_tabs(monkeypatch):
     videos = whisper_pipeline.index_channel("https://www.youtube.com/@test")
 
     assert captured["cmd"][-1] == "https://www.youtube.com/@test/videos"
+    runtime_index = captured["cmd"].index("--js-runtimes")
+    assert captured["cmd"][runtime_index + 1] == "deno"
     assert [video["video_id"] for video in videos] == ["vid1"]
     assert videos[0]["url"] == "https://www.youtube.com/watch?v=vid1"
     assert whisper_pipeline.normalize_channel_url(

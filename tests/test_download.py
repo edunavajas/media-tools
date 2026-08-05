@@ -177,5 +177,6 @@ def test_ytdlp_options_are_opt_in(monkeypatch, tmp_path):
 
     monkeypatch.setattr(downloader.yt_dlp, "YoutubeDL", CapturingYoutubeDL)
     downloader.download_video("https://example.com/watch?v=abc123", tmp_path)
+    assert captured["js_runtimes"] == {"deno": {}}
     assert captured["cookiefile"] == "/run/secrets/youtube-cookies.txt"
     assert captured["proxy"] == "http://proxy.test:8080"

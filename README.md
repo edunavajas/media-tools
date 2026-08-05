@@ -77,6 +77,7 @@ See `.env.example`. Highlights:
 - `DATA_DIR=/data` (SQLite `jobs.db` + job outputs)
 - `YTDLP_AUTOUPDATE=1` upgrades yt-dlp at container start (YouTube
   extraction breaks often; the pinned version is in `requirements.txt`)
+- `YTDLP_JS_RUNTIME=deno` enables the Deno runtime used by yt-dlp EJS
 - `YTDLP_COOKIES_FILE` optionally points to a mounted Netscape-format cookies
   file; keep it in a Coolify secret/file mount and never commit it
 - `YTDLP_PROXY` optionally configures the proxy used by both download and

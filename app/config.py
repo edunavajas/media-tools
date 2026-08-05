@@ -5,6 +5,7 @@ vars without reloading modules.
 """
 import os
 from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
 
@@ -48,9 +49,13 @@ def ytdlp_autoupdate() -> bool:
     return os.environ.get("YTDLP_AUTOUPDATE", "0") == "1"
 
 
-def ytdlp_options() -> dict[str, str]:
-    """Return optional yt-dlp Python API options from the environment."""
-    options: dict[str, str] = {}
+def ytdlp_js_runtime() -> str:
+    return os.environ.get("YTDLP_JS_RUNTIME", "deno")
+
+
+def ytdlp_options() -> dict[str, Any]:
+    """Return yt-dlp Python API options from the environment."""
+    options: dict[str, Any] = {"js_runtimes": {ytdlp_js_runtime(): {}}}
     cookies_file = os.environ.get("YTDLP_COOKIES_FILE")
     proxy = os.environ.get("YTDLP_PROXY")
     if cookies_file:
@@ -61,8 +66,8 @@ def ytdlp_options() -> dict[str, str]:
 
 
 def ytdlp_cli_args() -> list[str]:
-    """Return optional yt-dlp CLI arguments without exposing their values."""
-    args: list[str] = []
+    """Return yt-dlp CLI arguments without exposing secret values."""
+    args: list[str] = ["--js-runtimes", ytdlp_js_runtime()]
     cookies_file = os.environ.get("YTDLP_COOKIES_FILE")
     proxy = os.environ.get("YTDLP_PROXY")
     if cookies_file:

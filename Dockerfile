@@ -1,4 +1,8 @@
+FROM denoland/deno:bin-2.8.3 AS deno
+
 FROM python:3.12-slim
+
+COPY --from=deno /deno /usr/local/bin/deno
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg \
@@ -14,6 +18,7 @@ COPY entrypoint.sh .
 RUN chmod +x entrypoint.sh
 
 ENV DATA_DIR=/data
+ENV YTDLP_JS_RUNTIME=deno
 VOLUME /data
 EXPOSE 8000
 
