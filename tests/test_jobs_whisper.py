@@ -1,10 +1,14 @@
 """Whisper job flow with mocked indexing/download/transcription (no network)."""
 import json
 import subprocess
+import sys
+from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 
 from app import whisper_pipeline
+from app import workers
 from app.schemas import ChannelExport
 from app.whisper_pipeline import TranscriptionConfig
 from tests.conftest import AUTH_HEADERS
@@ -51,6 +55,18 @@ TRANSCRIPT_FIXTURE = {
     "language": "es",
     "duration": 3.0,
 }
+
+
+def test_groq_provider_is_selected_from_environment(monkeypatch):
+    monkeypatch.setenv("TRANSCRIPTION_PROVIDER", "groq")
+    monkeypatch.setenv("GROQ_API_KEY", "unit-test-key")
+    monkeypatch.setenv("GROQ_MODEL", "whisper-large-v3")
+
+    config = workers._transcription_config("es")
+
+    assert config.provider == "groq"
+    assert config.groq_api_key == "unit-test-key"
+    assert config.groq_model == "whisper-large-v3"
 
 
 def _mock_pipeline(monkeypatch, fail_video_id=None):
@@ -299,6 +315,127 @@ def test_speaches_verbose_json_parsing(tmp_path, monkeypatch):
     assert captured["data"]["task"] == "transcribe"
     assert captured["data"]["response_format"] == "verbose_json"
     assert "español" in captured["data"]["initial_prompt"]
+
+
+def test_groq_provider_uses_sdk_and_normalizes_response(tmp_path, monkeypatch):
+    """Groq SDK/Pydantic responses become the existing transcription dict."""
+    captured = {}
+
+    class FakeSegment:
+        def to_dict(self):
+            return {"start": 0.0, "end": 1.5, "text": "hola mundo"}
+
+    class FakeResponse:
+        def to_dict(self):
+            return {
+                "text": "hola mundo",
+                "segments": [FakeSegment()],
+                "language": "es",
+                "duration": 1.5,
+                "task": "transcribe",
+            }
+
+    class FakeTranscriptions:
+        def create(self, **kwargs):
+            captured.update(kwargs)
+            return FakeResponse()
+
+    class FakeGroq:
+        def __init__(self, **kwargs):
+            captured["client"] = kwargs
+            self.audio = SimpleNamespace(
+                transcriptions=FakeTranscriptions()
+            )
+
+    monkeypatch.setitem(sys.modules, "groq", SimpleNamespace(Groq=FakeGroq))
+
+    audio = tmp_path / "audio.mp3"
+    audio.write_bytes(b"fake mp3")
+    config = TranscriptionConfig(
+        base_url="http://speaches.test",
+        endpoint="/v1/audio/transcriptions",
+        mode="openai",
+        model="unused-speaches-model",
+        language="es",
+        timeout=60,
+        provider="groq",
+        groq_api_key="unit-test-key",
+        groq_model="whisper-large-v3-turbo",
+    )
+
+    result = whisper_pipeline.transcribe_audio(audio, config)
+
+    assert result == {
+        "text": "hola mundo",
+        "segments": [{"start": 0.0, "end": 1.5, "text": "hola mundo"}],
+        "language": "es",
+        "duration": 1.5,
+    }
+    assert captured["client"] == {
+        "api_key": "unit-test-key",
+        "timeout": 60,
+    }
+    assert captured["model"] == "whisper-large-v3-turbo"
+    assert captured["response_format"] == "verbose_json"
+    assert captured["language"] == "es"
+    assert captured["timestamp_granularities"] == ["segment"]
+    assert captured["file"].name == str(audio)
+
+
+def test_groq_audio_preparation_cleans_temporary_file(tmp_path, monkeypatch):
+    """Oversized Groq uploads are downsampled and their temporary file is removed."""
+    captured = {}
+
+    class FakeTranscriptions:
+        def create(self, **kwargs):
+            captured["upload_path"] = Path(kwargs["file"].name)
+            return {
+                "text": "hola",
+                "segments": [],
+                "language": "es",
+                "duration": 1.0,
+            }
+
+    class FakeGroq:
+        def __init__(self, **kwargs):
+            self.audio = SimpleNamespace(
+                transcriptions=FakeTranscriptions()
+            )
+
+    def fake_ffmpeg(command, **kwargs):
+        captured["ffmpeg"] = command
+        Path(command[-1]).write_bytes(b"converted mp3")
+
+    monkeypatch.setitem(sys.modules, "groq", SimpleNamespace(Groq=FakeGroq))
+    monkeypatch.setattr(whisper_pipeline.subprocess, "run", fake_ffmpeg)
+
+    audio = tmp_path / "large.mp3"
+    audio.touch()
+    audio.write_bytes(b"x" * (whisper_pipeline.GROQ_AUDIO_SIZE_THRESHOLD + 1))
+    config = TranscriptionConfig(
+        base_url="unused",
+        endpoint="unused",
+        mode="openai",
+        model="unused",
+        language="es",
+        timeout=60,
+        provider="groq",
+        groq_api_key="unit-test-key",
+    )
+
+    result = whisper_pipeline.transcribe_audio(audio, config)
+
+    assert result["text"] == "hola"
+    assert captured["upload_path"] != audio
+    assert not captured["upload_path"].exists()
+    assert captured["ffmpeg"][0:2] == ["ffmpeg", "-y"]
+    assert captured["ffmpeg"][-5:] == [
+        "-c:a",
+        "libmp3lame",
+        "-b:a",
+        "64k",
+        str(captured["upload_path"]),
+    ]
 
 
 def test_whisper_job_index_failure_marks_failed(client, monkeypatch):

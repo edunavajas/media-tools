@@ -36,6 +36,9 @@ def _transcription_config(language: str) -> TranscriptionConfig:
         model=config.speaches_model(),
         language=language,
         timeout=config.timeout_seconds(),
+        provider=config.transcription_provider(),
+        groq_api_key=config.groq_api_key(),
+        groq_model=config.groq_model(),
     )
 
 

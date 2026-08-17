@@ -5,7 +5,8 @@ FastAPI microservice for two media jobs, built for edunavajas-hub
 
 - **whisper**: index a YouTube channel with yt-dlp, download each video's
   audio and transcribe it against a [speaches](https://github.com/speaches-ai/speaches)
-  (faster-whisper) server, and consolidate everything into a `channel.json`.
+  (faster-whisper) server or Groq's Whisper API, and consolidate everything
+  into a `channel.json`.
 - **download**: download a single video as mp4 from any yt-dlp supported
   site (~1000+), with progress tracking.
 
@@ -71,9 +72,12 @@ filename, metadata: {title, extractor, duration, filesize, thumbnail}}`.
 See `.env.example`. Highlights:
 
 - `MEDIA_TOOLS_TOKEN` (required, fail-closed)
+- `TRANSCRIPTION_PROVIDER=speaches` (default) or `groq`
 - `SPEACHES_BASE_URL`, `SPEACHES_ENDPOINT=/v1/audio/transcriptions`,
   `SPEACHES_MODE=openai` (falls back to the generic `/transcribe`
   endpoint), `SPEACHES_MODEL`, `TIMEOUT_SECONDS=1800`
+- `GROQ_API_KEY` (required when `TRANSCRIPTION_PROVIDER=groq`) and
+  `GROQ_MODEL=whisper-large-v3-turbo`
 - `DATA_DIR=/data` (SQLite `jobs.db` + job outputs)
 - `YTDLP_AUTOUPDATE=1` upgrades yt-dlp at container start (YouTube
   extraction breaks often; the pinned version is in `requirements.txt`)
@@ -92,6 +96,14 @@ python3 -m venv .venv
 MEDIA_TOOLS_TOKEN=secret SPEACHES_BASE_URL=http://localhost:8000 \
   .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
+
+To use Groq, set `TRANSCRIPTION_PROVIDER=groq`, `GROQ_API_KEY`, and optionally
+`GROQ_MODEL` in the environment before starting the service. The Groq path
+uses the official Python SDK and sends the requested language (Spanish by
+default) as `verbose_json` with segment timestamps. Audio larger than the safe
+upload threshold is converted
+with ffmpeg to a 16 kHz mono MP3 at 64 kbps and the temporary file is removed
+after the request.
 
 Docker:
 

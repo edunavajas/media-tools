@@ -14,6 +14,7 @@ import logging
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,6 +27,8 @@ from app import config
 
 logger = logging.getLogger(__name__)
 
+GROQ_AUDIO_SIZE_THRESHOLD = 24_000_000
+
 
 @dataclass
 class TranscriptionConfig:
@@ -36,6 +39,9 @@ class TranscriptionConfig:
     model: str
     language: str
     timeout: int
+    provider: str = "speaches"
+    groq_api_key: str | None = None
+    groq_model: str = "whisper-large-v3-turbo"
 
 
 @dataclass
@@ -514,6 +520,117 @@ def transcribe_audio_generic_style(
         return None
 
 
+def _serialize_groq_value(value: Any) -> Any:
+    """Convert Groq SDK/Pydantic values into JSON-compatible Python values."""
+    if isinstance(value, dict):
+        return {key: _serialize_groq_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_serialize_groq_value(item) for item in value]
+    if hasattr(value, "to_dict"):
+        return _serialize_groq_value(value.to_dict())
+    if hasattr(value, "model_dump"):
+        return _serialize_groq_value(value.model_dump())
+    return value
+
+
+def _normalize_groq_response(response: Any) -> dict[str, Any]:
+    """Normalize the Groq response to the pipeline's existing dict shape."""
+    payload = _serialize_groq_value(response)
+    if not isinstance(payload, dict):
+        raise TypeError("Groq transcription response was not an object")
+
+    return {
+        "text": payload.get("text", ""),
+        "segments": payload.get("segments") or [],
+        "language": payload.get("language"),
+        "duration": payload.get("duration"),
+    }
+
+
+def _prepare_groq_audio(audio_path: Path) -> tuple[Path, Path | None]:
+    """Create a smaller mono MP3 for Groq when the source exceeds the safe limit."""
+    if audio_path.stat().st_size <= GROQ_AUDIO_SIZE_THRESHOLD:
+        return audio_path, None
+
+    temporary_file = tempfile.NamedTemporaryFile(
+        prefix="groq-audio-",
+        suffix=".mp3",
+        dir=audio_path.parent,
+        delete=False,
+    )
+    temporary_path = Path(temporary_file.name)
+    temporary_file.close()
+
+    try:
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(audio_path),
+                "-map",
+                "0:a:0",
+                "-ar",
+                "16000",
+                "-ac",
+                "1",
+                "-c:a",
+                "libmp3lame",
+                "-b:a",
+                "64k",
+                str(temporary_path),
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        temporary_path.unlink(missing_ok=True)
+        logger.error("Groq audio preparation failed")
+        raise RuntimeError("Groq audio preparation failed") from exc
+
+    return temporary_path, temporary_path
+
+
+def transcribe_audio_groq(
+    audio_path: Path,
+    config: TranscriptionConfig,
+) -> Optional[dict[str, Any]]:
+    """Transcribe audio through the official Groq Python SDK."""
+    if not config.groq_api_key:
+        logger.error("Groq transcription unavailable: GROQ_API_KEY is not configured")
+        return None
+
+    prepared_path: Path | None = None
+    temporary_path: Path | None = None
+    try:
+        prepared_path, temporary_path = _prepare_groq_audio(audio_path)
+
+        # Import lazily so the existing Speaches path does not depend on the
+        # optional SDK being importable during local/test-only use.
+        from groq import Groq
+
+        client = Groq(api_key=config.groq_api_key, timeout=config.timeout)
+        with prepared_path.open("rb") as audio_file:
+            response = client.audio.transcriptions.create(
+                file=audio_file,
+                model=config.groq_model,
+                response_format="verbose_json",
+                language=config.language,
+                timestamp_granularities=["segment"],
+            )
+
+        result = _normalize_groq_response(response)
+        _check_language(result, config.language)
+        return result
+    except Exception:
+        logger.error("Groq transcription failed")
+        return None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
 def transcribe_audio(
     audio_path: Path,
     config: TranscriptionConfig,
@@ -524,6 +641,9 @@ def transcribe_audio(
     Returns:
         Transcription result dict or None if failed
     """
+    if config.provider.strip().lower() == "groq":
+        return transcribe_audio_groq(audio_path, config)
+
     with httpx.Client() as client:
         if config.mode == "openai":
             # Try OpenAI-compatible endpoint first

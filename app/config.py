@@ -36,6 +36,18 @@ def speaches_model() -> str:
     return os.environ.get("SPEACHES_MODEL", "Systran/faster-whisper-small")
 
 
+def transcription_provider() -> str:
+    return os.environ.get("TRANSCRIPTION_PROVIDER", "speaches").strip().lower()
+
+
+def groq_api_key() -> str | None:
+    return os.environ.get("GROQ_API_KEY") or None
+
+
+def groq_model() -> str:
+    return os.environ.get("GROQ_MODEL", "whisper-large-v3-turbo")
+
+
 def timeout_seconds() -> int:
     return int(os.environ.get("TIMEOUT_SECONDS", "1800"))
 
