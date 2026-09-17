@@ -42,11 +42,41 @@ def extract_metadata(info: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _hhmmss_tag(seconds: Optional[float]) -> str:
+    """Render seconds as zero-padded HH-MM-SS; None (open end) as END."""
+    if seconds is None:
+        return "END"
+    total = int(seconds)
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}-{minutes:02d}-{secs:02d}"
+
+
+def _download_ranges(
+    start_seconds: Optional[float], end_seconds: Optional[float]
+) -> Callable[[dict[str, Any], Any], list[dict[str, float]]]:
+    """Build the yt-dlp download_ranges callable for a time fragment."""
+
+    def _ranges(
+        info_dict: dict[str, Any], ydl: Any
+    ) -> list[dict[str, float]]:
+        return [{
+            "start_time": start_seconds or 0.0,
+            "end_time": (
+                end_seconds if end_seconds is not None else float("inf")
+            ),
+        }]
+
+    return _ranges
+
+
 def download_video(
     url: str,
     output_dir: Path,
     progress_hook: Optional[Callable[[dict[str, Any]], None]] = None,
     hook_throttle_seconds: float = 1.0,
+    start_seconds: Optional[float] = None,
+    end_seconds: Optional[float] = None,
 ) -> tuple[Path, dict[str, Any]]:
     """
     Download a video as mp4 into output_dir.
@@ -57,6 +87,8 @@ def download_video(
         progress_hook: Called with throttled progress dicts:
             {percent, downloaded_bytes, total_bytes, speed, eta, filename}
         hook_throttle_seconds: Minimum interval between "downloading" updates
+        start_seconds: Optional fragment start (seconds, inclusive)
+        end_seconds: Optional fragment end (seconds, exclusive)
 
     Returns:
         (final mp4 path, metadata dict)
@@ -102,14 +134,29 @@ def download_video(
                 "filename": d.get("filename"),
             })
 
+    has_range = start_seconds is not None or end_seconds is not None
+    if has_range:
+        trim_tag = (
+            f" [trim-{_hhmmss_tag(start_seconds)}-{_hhmmss_tag(end_seconds)}]"
+        )
+        outtmpl = str(
+            output_dir / f"%(title).80s [%(id)s]{trim_tag}.%(ext)s"
+        )
+    else:
+        outtmpl = str(output_dir / "%(title).80s [%(id)s].%(ext)s")
+
     ydl_opts: dict[str, Any] = {
         "format": DOWNLOAD_FORMAT,
         "merge_output_format": "mp4",
-        "outtmpl": str(output_dir / "%(title).80s [%(id)s].%(ext)s"),
+        "outtmpl": outtmpl,
         "noplaylist": True,
         "no_warnings": True,
         "progress_hooks": [_hook],
     }
+    if has_range:
+        ydl_opts["download_ranges"] = _download_ranges(
+            start_seconds, end_seconds
+        )
     ydl_opts.update(config.ytdlp_options())
 
     try:
@@ -144,3 +191,37 @@ def download_video(
 
     logger.info(f"Downloaded {url} -> {final_path}")
     return final_path, metadata
+
+
+def probe_video(url: str) -> dict[str, Any]:
+    """
+    Extract metadata for a URL without downloading it.
+
+    Raises:
+        RuntimeError: if yt-dlp fails or returns no info.
+    """
+    ydl_opts: dict[str, Any] = {
+        "skip_download": True,
+        "noplaylist": True,
+        "no_warnings": True,
+    }
+    ydl_opts.update(config.ytdlp_options())
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except yt_dlp.utils.DownloadError as e:
+        raise RuntimeError(f"yt-dlp probe failed: {e}") from e
+
+    if info is None:
+        raise RuntimeError("yt-dlp returned no info for the URL")
+
+    duration = info.get("duration")
+    return {
+        "url": url,
+        "title": info.get("title"),
+        "duration": float(duration) if duration is not None else None,
+        "extractor": info.get("extractor"),
+        "thumbnail": info.get("thumbnail"),
+        "is_live": bool(info.get("is_live")),
+    }

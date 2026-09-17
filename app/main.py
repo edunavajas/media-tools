@@ -11,9 +11,15 @@ from fastapi.responses import FileResponse, StreamingResponse
 
 from app import config, workers
 from app.auth import require_token
-from app.downloader import SUPPORTED_SITES, SUPPORTED_SITES_NOTE
+from app.downloader import (
+    SUPPORTED_SITES,
+    SUPPORTED_SITES_NOTE,
+    probe_video,
+)
 from app.jobs_store import JobStore
 from app.schemas import (
+    DownloadProbe,
+    DownloadProbeRequest,
     DownloadRequest,
     JobCreated,
     JobDetail,
@@ -133,13 +139,52 @@ def download_channel_json(job_id: str) -> FileResponse:
 def create_download_job(req: DownloadRequest) -> JobCreated:
     if not req.url.startswith(("http://", "https://")):
         raise HTTPException(status_code=400, detail="only http/https URLs")
+    if req.end_seconds is not None and req.start_seconds is None:
+        raise HTTPException(
+            status_code=400,
+            detail="start_seconds is required when end_seconds is set",
+        )
+    if (
+        req.start_seconds is not None
+        and req.end_seconds is not None
+        and req.end_seconds <= req.start_seconds
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="end_seconds must be greater than start_seconds",
+        )
+    if (
+        req.start_seconds is not None
+        and req.end_seconds is not None
+        and req.end_seconds - req.start_seconds < 0.5
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="trim range must be at least 0.5 seconds",
+        )
     store = get_store()
     job_id = store.create_job(
-        "download", {"url": req.url}, config.data_dir() / "download" / "pending"
+        "download",
+        {
+            "url": req.url,
+            "start_seconds": req.start_seconds,
+            "end_seconds": req.end_seconds,
+        },
+        config.data_dir() / "download" / "pending",
     )
     store.set_output_dir(job_id, config.data_dir() / "download" / job_id)
     workers.submit(store, job_id, "download")
     return JobCreated(job_id=job_id)
+
+
+@app.post("/download/probe", response_model=DownloadProbe, dependencies=AUTH)
+def probe_download(req: DownloadProbeRequest) -> dict:
+    if not req.url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="only http/https URLs")
+    try:
+        return probe_video(req.url)
+    except RuntimeError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
 
 
 @app.get("/download/supported", response_model=SupportedSitesResponse,

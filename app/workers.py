@@ -146,6 +146,8 @@ def run_download_job(store: JobStore, job_id: str) -> None:
             logger.error(f"download job {job_id} not found")
             return
         url = job["params"]["url"]
+        start_seconds = job["params"].get("start_seconds")
+        end_seconds = job["params"].get("end_seconds")
         output_dir = Path(job["output_dir"])
 
         store.set_status(job_id, "running")
@@ -172,7 +174,11 @@ def run_download_job(store: JobStore, job_id: str) -> None:
             )
 
         final_path, metadata = downloader.download_video(
-            url, output_dir, progress_hook=on_progress
+            url,
+            output_dir,
+            progress_hook=on_progress,
+            start_seconds=start_seconds,
+            end_seconds=end_seconds,
         )
 
         store.update_progress(

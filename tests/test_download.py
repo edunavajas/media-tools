@@ -22,6 +22,16 @@ class FakeYoutubeDL:
         return False
 
     def extract_info(self, url, download=True):
+        info = {
+            "title": "Fake video",
+            "extractor": "generic",
+            "duration": 12,
+            "filesize": len(FAKE_FILE_BYTES),
+            "thumbnail": "https://example.com/thumb.jpg",
+        }
+        if not download:
+            return info
+
         out_dir = Path(self.opts["outtmpl"]).parent
         out_dir.mkdir(parents=True, exist_ok=True)
         target = out_dir / "Fake video [abc123].mp4"
@@ -46,14 +56,25 @@ class FakeYoutubeDL:
                 "filename": str(target),
             })
 
-        return {
-            "title": "Fake video",
-            "extractor": "generic",
-            "duration": 12,
-            "filesize": len(FAKE_FILE_BYTES),
-            "thumbnail": "https://example.com/thumb.jpg",
-            "requested_downloads": [{"filepath": str(target)}],
-        }
+        info["requested_downloads"] = [{"filepath": str(target)}]
+        return info
+
+
+class CapturingYoutubeDL(FakeYoutubeDL):
+    """FakeYoutubeDL that records the opts it was built with."""
+
+    last_opts: dict = {}
+
+    def __init__(self, opts):
+        CapturingYoutubeDL.last_opts = opts
+        super().__init__(opts)
+
+
+class FailingYoutubeDL(FakeYoutubeDL):
+    """FakeYoutubeDL whose extraction always fails."""
+
+    def extract_info(self, url, download=True):
+        raise downloader.yt_dlp.utils.DownloadError("extractor exploded")
 
 
 def _mock_ydl(monkeypatch):
@@ -180,3 +201,141 @@ def test_ytdlp_options_are_opt_in(monkeypatch, tmp_path):
     assert captured["js_runtimes"] == {"deno": {}}
     assert captured["cookiefile"] == "/run/secrets/youtube-cookies.txt"
     assert captured["proxy"] == "http://proxy.test:8080"
+
+
+# ---------------------------------------------------------------- probe
+
+
+def test_probe_happy_path(client, monkeypatch):
+    _mock_ydl(monkeypatch)
+
+    resp = client.post(
+        "/download/probe",
+        json={"url": "https://example.com/watch?v=abc123"},
+        headers=AUTH_HEADERS,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["url"] == "https://example.com/watch?v=abc123"
+    assert body["title"] == "Fake video"
+    assert body["duration"] == 12.0
+    assert body["extractor"] == "generic"
+    assert body["thumbnail"] == "https://example.com/thumb.jpg"
+    assert body["is_live"] is False
+
+
+def test_probe_rejects_non_http(client):
+    resp = client.post(
+        "/download/probe",
+        json={"url": "file:///etc/passwd"},
+        headers=AUTH_HEADERS,
+    )
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "only http/https URLs"
+
+
+def test_probe_extractor_failure_is_422(client, monkeypatch):
+    monkeypatch.setattr(downloader.yt_dlp, "YoutubeDL", FailingYoutubeDL)
+
+    resp = client.post(
+        "/download/probe",
+        json={"url": "https://example.com/watch?v=abc123"},
+        headers=AUTH_HEADERS,
+    )
+    assert resp.status_code == 422
+    assert "yt-dlp probe failed" in resp.json()["detail"]
+
+
+# ---------------------------------------------------------------- trim ranges
+
+
+def test_download_with_range_sets_download_ranges(monkeypatch, tmp_path):
+    monkeypatch.setattr(downloader.yt_dlp, "YoutubeDL", CapturingYoutubeDL)
+
+    downloader.download_video(
+        "https://example.com/watch?v=abc123",
+        tmp_path,
+        start_seconds=12.0,
+        end_seconds=30.0,
+    )
+
+    opts = CapturingYoutubeDL.last_opts
+    assert "force_keyframes_at_cuts" not in opts
+    assert opts["download_ranges"]({}, None) == [
+        {"start_time": 12.0, "end_time": 30.0}
+    ]
+    assert "[trim-00-00-12-00-00-30]" in opts["outtmpl"]
+
+
+def test_download_open_ended_range_uses_inf(monkeypatch, tmp_path):
+    monkeypatch.setattr(downloader.yt_dlp, "YoutubeDL", CapturingYoutubeDL)
+
+    downloader.download_video(
+        "https://example.com/watch?v=abc123",
+        tmp_path,
+        start_seconds=5.0,
+    )
+
+    opts = CapturingYoutubeDL.last_opts
+    assert opts["download_ranges"]({}, None) == [
+        {"start_time": 5.0, "end_time": float("inf")}
+    ]
+    assert "END" in opts["outtmpl"]
+
+
+def test_default_download_has_no_range_and_unchanged_outtmpl(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(downloader.yt_dlp, "YoutubeDL", CapturingYoutubeDL)
+
+    downloader.download_video("https://example.com/watch?v=abc123", tmp_path)
+
+    opts = CapturingYoutubeDL.last_opts
+    assert "download_ranges" not in opts
+    assert opts["outtmpl"] == str(
+        tmp_path / "%(title).80s [%(id)s].%(ext)s"
+    )
+
+
+def test_download_rejects_end_without_start(client):
+    resp = client.post(
+        "/download",
+        json={"url": "https://example.com/watch?v=abc123", "end_seconds": 10},
+        headers=AUTH_HEADERS,
+    )
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == (
+        "start_seconds is required when end_seconds is set"
+    )
+
+
+def test_download_rejects_end_not_after_start(client):
+    resp = client.post(
+        "/download",
+        json={
+            "url": "https://example.com/watch?v=abc123",
+            "start_seconds": 30,
+            "end_seconds": 10,
+        },
+        headers=AUTH_HEADERS,
+    )
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == (
+        "end_seconds must be greater than start_seconds"
+    )
+
+
+def test_download_rejects_range_shorter_than_half_second(client):
+    resp = client.post(
+        "/download",
+        json={
+            "url": "https://example.com/watch?v=abc123",
+            "start_seconds": 10.0,
+            "end_seconds": 10.2,
+        },
+        headers=AUTH_HEADERS,
+    )
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == (
+        "trim range must be at least 0.5 seconds"
+    )

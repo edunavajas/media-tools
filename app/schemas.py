@@ -12,6 +12,21 @@ class WhisperJobRequest(BaseModel):
 
 class DownloadRequest(BaseModel):
     url: str
+    start_seconds: Optional[float] = Field(default=None, ge=0)
+    end_seconds: Optional[float] = Field(default=None, gt=0)
+
+
+class DownloadProbeRequest(BaseModel):
+    url: str
+
+
+class DownloadProbe(BaseModel):
+    url: str
+    title: Optional[str] = None
+    duration: Optional[float] = None
+    extractor: Optional[str] = None
+    thumbnail: Optional[str] = None
+    is_live: bool = False
 
 
 class JobCreated(BaseModel):
