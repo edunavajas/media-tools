@@ -4,8 +4,8 @@ FastAPI microservice for two media jobs, built for edunavajas-hub
 (issue edunavajas/edunavajas-hub#59):
 
 - **whisper**: index a YouTube channel with yt-dlp, download each video's
-  audio and transcribe it against a [speaches](https://github.com/speaches-ai/speaches)
-  (faster-whisper) server or Groq's Whisper API, and consolidate everything
+  audio and transcribe it with the Whisper model of the Nan Builders
+  OpenAI-compatible API (or Groq's Whisper API), and consolidate everything
   into a `channel.json`.
 - **download**: download a single video as mp4 from any yt-dlp supported
   site (~1000+), with progress tracking.
@@ -72,10 +72,9 @@ filename, metadata: {title, extractor, duration, filesize, thumbnail}}`.
 See `.env.example`. Highlights:
 
 - `MEDIA_TOOLS_TOKEN` (required, fail-closed)
-- `TRANSCRIPTION_PROVIDER=speaches` (default) or `groq`
-- `SPEACHES_BASE_URL`, `SPEACHES_ENDPOINT=/v1/audio/transcriptions`,
-  `SPEACHES_MODE=openai` (falls back to the generic `/transcribe`
-  endpoint), `SPEACHES_MODEL`, `TIMEOUT_SECONDS=1800`
+- `TRANSCRIPTION_PROVIDER=nan` (default) or `groq`
+- `NAN_BASE_URL=https://api.nan.builders/v1`, `NAN_API_KEY` (required when
+  `TRANSCRIPTION_PROVIDER=nan`), `NAN_MODEL=whisper`, `TIMEOUT_SECONDS=1800`
 - `GROQ_API_KEY` (required when `TRANSCRIPTION_PROVIDER=groq`) and
   `GROQ_MODEL=whisper-large-v3-turbo`
 - `DATA_DIR=/data` (SQLite `jobs.db` + job outputs)
@@ -93,10 +92,12 @@ See `.env.example`. Highlights:
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-MEDIA_TOOLS_TOKEN=secret SPEACHES_BASE_URL=http://localhost:8000 \
+MEDIA_TOOLS_TOKEN=secret NAN_API_KEY=... \
   .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
+Transcription defaults to Nan Builders (`NAN_BASE_URL`, `NAN_API_KEY`,
+`NAN_MODEL=whisper`) and reaches `POST /audio/transcriptions` with Bearer auth.
 To use Groq, set `TRANSCRIPTION_PROVIDER=groq`, `GROQ_API_KEY`, and optionally
 `GROQ_MODEL` in the environment before starting the service. The Groq path
 uses the official Python SDK and sends the requested language (Spanish by
@@ -110,12 +111,12 @@ Docker:
 ```bash
 docker build -t media-tools .
 docker run -p 8000:8000 -v media-tools-data:/data \
-  -e MEDIA_TOOLS_TOKEN=secret -e SPEACHES_BASE_URL=http://speaches:8000 \
+  -e MEDIA_TOOLS_TOKEN=secret -e NAN_API_KEY=... \
   media-tools
 ```
 
-`docker-compose.yml` spins up the app plus a CPU speaches instance for
-local testing.
+`docker-compose.yml` runs the app alone; transcription calls the Nan
+Builders API over the network.
 
 ## Tests
 
@@ -129,11 +130,7 @@ inline inside the test client.
 
 ## Verified end-to-end
 
-- Real whisper job against a local CPU speaches container
-  (`ghcr.io/speaches-ai/speaches:latest-cpu`, model
-  `Systran/faster-whisper-tiny` — pull it first with
-  `POST /v1/models/Systran/faster-whisper-tiny`, speaches 404s on
-  unknown models) with `max_videos=2` on NASA's public Twitch clips page
+- Real whisper job with `max_videos=2` on NASA's public Twitch clips page
   `https://www.twitch.tv/nasa/clips?filter=clips&range=all` (all clips
   <= 60s) → valid `channel.json` with non-empty `transcript.text` and
   timestamped segments.

@@ -30,13 +30,12 @@ _active_downloads: set[str] = set()
 
 def _transcription_config(language: str) -> TranscriptionConfig:
     return TranscriptionConfig(
-        base_url=config.speaches_base_url(),
-        endpoint=config.speaches_endpoint(),
-        mode=config.speaches_mode(),
-        model=config.speaches_model(),
+        base_url=config.nan_base_url(),
+        model=config.nan_model(),
         language=language,
         timeout=config.timeout_seconds(),
         provider=config.transcription_provider(),
+        api_key=config.nan_api_key(),
         groq_api_key=config.groq_api_key(),
         groq_model=config.groq_model(),
     )

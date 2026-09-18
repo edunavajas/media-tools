@@ -227,9 +227,7 @@ def test_audio_download_error_keeps_yt_dlp_cause_bounded(tmp_path, monkeypatch):
         output_dir=tmp_path / "vid1",
     )
     config = TranscriptionConfig(
-        base_url="http://speaches.test",
-        endpoint="/v1/audio/transcriptions",
-        mode="openai",
+        base_url="http://nan.test",
         model="test-model",
         language="es",
         timeout=60,
@@ -244,9 +242,9 @@ def test_audio_download_error_keeps_yt_dlp_cause_bounded(tmp_path, monkeypatch):
     assert len(error) <= 530
 
 
-def test_speaches_verbose_json_parsing(tmp_path, monkeypatch):
-    """transcribe_audio parses a real speaches verbose_json response."""
-    speaches_payload = {
+def test_nan_verbose_json_parsing(tmp_path, monkeypatch):
+    """transcribe_audio parses an OpenAI-compatible verbose_json response."""
+    nan_payload = {
         "text": "hola mundo esto es una transcripción",
         "segments": [
             {
@@ -280,12 +278,13 @@ def test_speaches_verbose_json_parsing(tmp_path, monkeypatch):
 
     captured = {}
 
-    def fake_post(self, url, files=None, data=None, timeout=None):
+    def fake_post(self, url, files=None, data=None, headers=None, timeout=None):
         captured["url"] = url
         captured["data"] = data
+        captured["headers"] = headers
         return httpx.Response(
             200,
-            json=speaches_payload,
+            json=nan_payload,
             request=httpx.Request("POST", url),
         )
 
@@ -294,27 +293,43 @@ def test_speaches_verbose_json_parsing(tmp_path, monkeypatch):
     audio = tmp_path / "audio.mp3"
     audio.write_bytes(b"fake mp3")
     config = TranscriptionConfig(
-        base_url="http://speaches.test",
-        endpoint="/v1/audio/transcriptions",
-        mode="openai",
-        model="Systran/faster-whisper-small",
+        base_url="http://nan.test",
+        model="whisper",
         language="es",
         timeout=60,
+        provider="nan",
+        api_key="test-key",
     )
 
     result = whisper_pipeline.transcribe_audio(audio, config)
 
     assert result is not None
-    assert result["text"] == speaches_payload["text"]
+    assert result["text"] == nan_payload["text"]
     assert result["language"] == "es"
     assert len(result["segments"]) == 2
     assert result["segments"][0]["start"] == 0.0
     assert result["segments"][1]["end"] == 3.0
-    # OpenAI-style endpoint with the anti-translation hints.
-    assert captured["url"] == "http://speaches.test/v1/audio/transcriptions"
-    assert captured["data"]["task"] == "transcribe"
+    # Nan Builders: OpenAI-compatible endpoint, Bearer auth, verbose_json.
+    assert captured["url"] == "http://nan.test/audio/transcriptions"
+    assert captured["headers"] == {"Authorization": "Bearer test-key"}
+    assert captured["data"]["model"] == "whisper"
+    assert captured["data"]["language"] == "es"
     assert captured["data"]["response_format"] == "verbose_json"
-    assert "español" in captured["data"]["initial_prompt"]
+
+
+def test_nan_provider_is_selected_from_environment(monkeypatch):
+    monkeypatch.setenv("TRANSCRIPTION_PROVIDER", "nan")
+    monkeypatch.setenv("NAN_BASE_URL", "http://nan.test")
+    monkeypatch.setenv("NAN_API_KEY", "unit-test-key")
+    monkeypatch.setenv("NAN_MODEL", "whisper")
+
+    config = workers._transcription_config("es")
+
+    assert config.provider == "nan"
+    assert config.base_url == "http://nan.test"
+    assert config.api_key == "unit-test-key"
+    assert config.model == "whisper"
+    assert config.endpoint == "/audio/transcriptions"
 
 
 def test_groq_provider_uses_sdk_and_normalizes_response(tmp_path, monkeypatch):
@@ -352,10 +367,8 @@ def test_groq_provider_uses_sdk_and_normalizes_response(tmp_path, monkeypatch):
     audio = tmp_path / "audio.mp3"
     audio.write_bytes(b"fake mp3")
     config = TranscriptionConfig(
-        base_url="http://speaches.test",
-        endpoint="/v1/audio/transcriptions",
-        mode="openai",
-        model="unused-speaches-model",
+        base_url="unused",
+        model="unused",
         language="es",
         timeout=60,
         provider="groq",
@@ -411,11 +424,9 @@ def test_groq_audio_preparation_cleans_temporary_file(tmp_path, monkeypatch):
 
     audio = tmp_path / "large.mp3"
     audio.touch()
-    audio.write_bytes(b"x" * (whisper_pipeline.GROQ_AUDIO_SIZE_THRESHOLD + 1))
+    audio.write_bytes(b"x" * (whisper_pipeline.AUDIO_API_SIZE_THRESHOLD + 1))
     config = TranscriptionConfig(
         base_url="unused",
-        endpoint="unused",
-        mode="openai",
         model="unused",
         language="es",
         timeout=60,

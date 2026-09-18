@@ -27,19 +27,22 @@ from app import config
 
 logger = logging.getLogger(__name__)
 
-GROQ_AUDIO_SIZE_THRESHOLD = 24_000_000
+# Safe upload ceiling shared by every OpenAI-compatible provider. Above it the
+# audio is re-encoded to 16 kHz mono MP3 before upload. ponytail: no chunking —
+# add segment-merge chunking if a provider ever 413s below this size.
+AUDIO_API_SIZE_THRESHOLD = 24_000_000
 
 
 @dataclass
 class TranscriptionConfig:
     """Configuration for transcription service."""
     base_url: str
-    endpoint: str
-    mode: str  # "openai" or "generic"
     model: str
     language: str
     timeout: int
-    provider: str = "speaches"
+    provider: str = "nan"
+    endpoint: str = "/audio/transcriptions"
+    api_key: str | None = None
     groq_api_key: str | None = None
     groq_model: str = "whisper-large-v3-turbo"
 
@@ -386,19 +389,6 @@ def download_audio(video_url: str, output_path: Path, cache_dir: Path) -> bool |
         return error
 
 
-def _apply_language_hint(data: dict[str, str], language: str) -> None:
-    """Add initial_prompt to help force language detection (Whisper hint)."""
-    if language == "es":
-        data["initial_prompt"] = (
-            "Transcribe en español sin traducir. No traduzcas. "
-            "Mantén el idioma original."
-        )
-    elif language == "en":
-        data["initial_prompt"] = (
-            "Transcribe in English without translating. Do not translate."
-        )
-
-
 def _check_language(result: dict[str, Any], requested: str) -> None:
     detected_lang = result.get("language", "unknown")
     logger.info(
@@ -412,20 +402,23 @@ def _check_language(result: dict[str, Any], requested: str) -> None:
         )
 
 
-def transcribe_audio_openai_style(
+def transcribe_audio_openai_compatible(
     audio_path: Path,
     config: TranscriptionConfig,
     client: httpx.Client,
 ) -> Optional[dict[str, Any]]:
     """
-    Transcribe audio using OpenAI-compatible API endpoint.
+    Transcribe audio using an OpenAI-compatible API endpoint.
 
     Returns:
         Transcription result dict or None if failed
     """
     url = f"{config.base_url.rstrip('/')}{config.endpoint}"
+    headers = (
+        {"Authorization": f"Bearer {config.api_key}"} if config.api_key else None
+    )
 
-    logger.debug(f"Transcribing via OpenAI-style API: {url}")
+    logger.debug(f"Transcribing via OpenAI-compatible API: {url}")
 
     try:
         with audio_path.open("rb") as audio_file:
@@ -433,77 +426,19 @@ def transcribe_audio_openai_style(
             data = {
                 "model": config.model,
                 "language": config.language,
-                "task": "transcribe",  # CRITICAL: Force transcribe, not translate
-                "translate": "false",   # Some servers honor this flag
-                "output_language": config.language,  # Some servers use this
                 "response_format": "verbose_json",
             }
-            _apply_language_hint(data, config.language)
 
             logger.info(
                 f"Sending transcription request: model={config.model}, "
-                f"language={config.language}, task=transcribe, translate=false"
+                f"language={config.language}"
             )
 
             response = client.post(
                 url,
                 files=files,
                 data=data,
-                timeout=config.timeout,
-            )
-            response.raise_for_status()
-
-            result = response.json()
-            _check_language(result, config.language)
-            return result
-
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 404:
-            logger.debug("Endpoint not found (404), will try fallback")
-            return None
-        logger.error(f"HTTP error {e.response.status_code}: {e.response.text}")
-        return None
-    except Exception as e:
-        logger.error(f"Transcription error: {e}")
-        return None
-
-
-def transcribe_audio_generic_style(
-    audio_path: Path,
-    config: TranscriptionConfig,
-    client: httpx.Client,
-) -> Optional[dict[str, Any]]:
-    """
-    Transcribe audio using generic API endpoint.
-
-    Returns:
-        Transcription result dict or None if failed
-    """
-    url = f"{config.base_url.rstrip('/')}/transcribe"
-
-    logger.debug(f"Transcribing via generic API: {url}")
-
-    try:
-        with audio_path.open("rb") as audio_file:
-            files = {"file": (audio_path.name, audio_file, "audio/mpeg")}
-            data = {
-                "model": config.model,
-                "language": config.language,
-                "task": "transcribe",  # CRITICAL: Force transcribe, not translate
-                "translate": "false",   # Some servers honor this flag
-                "output_language": config.language,  # Some servers use this
-            }
-            _apply_language_hint(data, config.language)
-
-            logger.info(
-                f"Sending transcription request: model={config.model}, "
-                f"language={config.language}, task=transcribe, translate=false"
-            )
-
-            response = client.post(
-                url,
-                files=files,
-                data=data,
+                headers=headers,
                 timeout=config.timeout,
             )
             response.raise_for_status()
@@ -547,13 +482,13 @@ def _normalize_groq_response(response: Any) -> dict[str, Any]:
     }
 
 
-def _prepare_groq_audio(audio_path: Path) -> tuple[Path, Path | None]:
-    """Create a smaller mono MP3 for Groq when the source exceeds the safe limit."""
-    if audio_path.stat().st_size <= GROQ_AUDIO_SIZE_THRESHOLD:
+def _prepare_audio_for_api(audio_path: Path) -> tuple[Path, Path | None]:
+    """Create a smaller mono MP3 when the source exceeds the safe upload limit."""
+    if audio_path.stat().st_size <= AUDIO_API_SIZE_THRESHOLD:
         return audio_path, None
 
     temporary_file = tempfile.NamedTemporaryFile(
-        prefix="groq-audio-",
+        prefix="api-audio-",
         suffix=".mp3",
         dir=audio_path.parent,
         delete=False,
@@ -586,8 +521,8 @@ def _prepare_groq_audio(audio_path: Path) -> tuple[Path, Path | None]:
         )
     except (OSError, subprocess.CalledProcessError) as exc:
         temporary_path.unlink(missing_ok=True)
-        logger.error("Groq audio preparation failed")
-        raise RuntimeError("Groq audio preparation failed") from exc
+        logger.error("Audio preparation failed")
+        raise RuntimeError("Audio preparation failed") from exc
 
     return temporary_path, temporary_path
 
@@ -604,10 +539,10 @@ def transcribe_audio_groq(
     prepared_path: Path | None = None
     temporary_path: Path | None = None
     try:
-        prepared_path, temporary_path = _prepare_groq_audio(audio_path)
+        prepared_path, temporary_path = _prepare_audio_for_api(audio_path)
 
-        # Import lazily so the existing Speaches path does not depend on the
-        # optional SDK being importable during local/test-only use.
+        # Import lazily so the Nan path does not depend on the optional SDK
+        # being importable during local/test-only use.
         from groq import Groq
 
         client = Groq(api_key=config.groq_api_key, timeout=config.timeout)
@@ -631,12 +566,30 @@ def transcribe_audio_groq(
             temporary_path.unlink(missing_ok=True)
 
 
+def transcribe_audio_nan(
+    audio_path: Path,
+    config: TranscriptionConfig,
+) -> Optional[dict[str, Any]]:
+    """Transcribe audio through Nan Builders' OpenAI-compatible Whisper API."""
+    if not config.api_key:
+        logger.error("Nan transcription unavailable: NAN_API_KEY is not configured")
+        return None
+
+    prepared_path, temporary_path = _prepare_audio_for_api(audio_path)
+    try:
+        with httpx.Client() as client:
+            return transcribe_audio_openai_compatible(prepared_path, config, client)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
 def transcribe_audio(
     audio_path: Path,
     config: TranscriptionConfig,
 ) -> Optional[dict[str, Any]]:
     """
-    Transcribe audio using configured service with automatic fallback.
+    Transcribe audio through the configured provider.
 
     Returns:
         Transcription result dict or None if failed
@@ -644,25 +597,7 @@ def transcribe_audio(
     if config.provider.strip().lower() == "groq":
         return transcribe_audio_groq(audio_path, config)
 
-    with httpx.Client() as client:
-        if config.mode == "openai":
-            # Try OpenAI-compatible endpoint first
-            result = transcribe_audio_openai_style(audio_path, config, client)
-            if result is not None:
-                return result
-
-            # Fallback to generic endpoint
-            logger.info("Falling back to generic endpoint")
-            result = transcribe_audio_generic_style(audio_path, config, client)
-            if result is not None:
-                return result
-        else:
-            # Try generic endpoint
-            result = transcribe_audio_generic_style(audio_path, config, client)
-            if result is not None:
-                return result
-
-    return None
+    return transcribe_audio_nan(audio_path, config)
 
 
 def format_timestamp(seconds: float) -> str:

@@ -20,24 +20,20 @@ def data_dir() -> Path:
     return Path(os.environ.get("DATA_DIR", "/data"))
 
 
-def speaches_base_url() -> str:
-    return os.environ.get("SPEACHES_BASE_URL", "http://localhost:8000")
+def nan_base_url() -> str:
+    return os.environ.get("NAN_BASE_URL", "https://api.nan.builders/v1")
 
 
-def speaches_endpoint() -> str:
-    return os.environ.get("SPEACHES_ENDPOINT", "/v1/audio/transcriptions")
+def nan_api_key() -> str | None:
+    return os.environ.get("NAN_API_KEY") or None
 
 
-def speaches_mode() -> str:
-    return os.environ.get("SPEACHES_MODE", "openai")
-
-
-def speaches_model() -> str:
-    return os.environ.get("SPEACHES_MODEL", "Systran/faster-whisper-small")
+def nan_model() -> str:
+    return os.environ.get("NAN_MODEL", "whisper")
 
 
 def transcription_provider() -> str:
-    return os.environ.get("TRANSCRIPTION_PROVIDER", "speaches").strip().lower()
+    return os.environ.get("TRANSCRIPTION_PROVIDER", "nan").strip().lower()
 
 
 def groq_api_key() -> str | None:

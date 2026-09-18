@@ -12,10 +12,9 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setenv("MEDIA_TOOLS_TOKEN", TEST_TOKEN)
     monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("WORKER_MODE", "sync")
-    monkeypatch.setenv("SPEACHES_BASE_URL", "http://speaches.test")
-    monkeypatch.setenv("SPEACHES_ENDPOINT", "/v1/audio/transcriptions")
-    monkeypatch.setenv("SPEACHES_MODE", "openai")
-    monkeypatch.setenv("SPEACHES_MODEL", "test-model")
+    monkeypatch.setenv("NAN_BASE_URL", "http://nan.test")
+    monkeypatch.setenv("NAN_API_KEY", "test-key")
+    monkeypatch.setenv("NAN_MODEL", "test-model")
     monkeypatch.setenv("TIMEOUT_SECONDS", "60")
     from app.main import app
 
