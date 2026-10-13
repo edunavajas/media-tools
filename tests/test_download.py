@@ -283,6 +283,52 @@ def test_download_open_ended_range_uses_inf(monkeypatch, tmp_path):
     assert "END" in opts["outtmpl"]
 
 
+def test_full_video_range_is_not_a_trim(monkeypatch, tmp_path):
+    # A "download everything" range (start=0, end=duration) must not trigger the
+    # ffmpeg section/merge path: yt-dlp's bare {} marker means "no section".
+    monkeypatch.setattr(downloader.yt_dlp, "YoutubeDL", CapturingYoutubeDL)
+
+    downloader.download_video(
+        "https://example.com/watch?v=abc123",
+        tmp_path,
+        start_seconds=0.0,
+        end_seconds=969.0,
+    )
+
+    ranges = CapturingYoutubeDL.last_opts["download_ranges"]
+    assert ranges({"duration": 969}, None) == [{}]
+    # duration may be slightly inaccurate; <1s drift still counts as whole video
+    assert ranges({"duration": 969.4}, None) == [{}]
+
+
+def test_open_ended_from_zero_is_not_a_trim(monkeypatch, tmp_path):
+    monkeypatch.setattr(downloader.yt_dlp, "YoutubeDL", CapturingYoutubeDL)
+
+    downloader.download_video(
+        "https://example.com/watch?v=abc123",
+        tmp_path,
+        start_seconds=0.0,
+    )
+
+    assert CapturingYoutubeDL.last_opts["download_ranges"]({}, None) == [{}]
+
+
+def test_sub_range_still_trims_when_duration_known(monkeypatch, tmp_path):
+    monkeypatch.setattr(downloader.yt_dlp, "YoutubeDL", CapturingYoutubeDL)
+
+    downloader.download_video(
+        "https://example.com/watch?v=abc123",
+        tmp_path,
+        start_seconds=0.0,
+        end_seconds=100.0,
+    )
+
+    ranges = CapturingYoutubeDL.last_opts["download_ranges"]
+    assert ranges({"duration": 969}, None) == [
+        {"start_time": 0.0, "end_time": 100.0}
+    ]
+
+
 def test_default_download_has_no_range_and_unchanged_outtmpl(
     monkeypatch, tmp_path
 ):

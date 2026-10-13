@@ -54,18 +54,29 @@ def _hhmmss_tag(seconds: Optional[float]) -> str:
 
 def _download_ranges(
     start_seconds: Optional[float], end_seconds: Optional[float]
-) -> Callable[[dict[str, Any], Any], list[dict[str, float]]]:
-    """Build the yt-dlp download_ranges callable for a time fragment."""
+) -> Callable[[dict[str, Any], Any], list[dict[str, Any]]]:
+    """Build the yt-dlp download_ranges callable for a time fragment.
+
+    A fragment that covers the whole video is NOT a trim: returning the bare
+    ``{}`` marker makes yt-dlp skip its ffmpeg section/merge path and stream the
+    file as-is (see YoutubeDL.process_info), avoiding a full re-encode. Clients
+    commonly send ``start=0, end=duration`` from a "full video" default, and
+    treating that as a trim used to re-encode hours of video.
+    """
 
     def _ranges(
         info_dict: dict[str, Any], ydl: Any
-    ) -> list[dict[str, float]]:
-        return [{
-            "start_time": start_seconds or 0.0,
-            "end_time": (
-                end_seconds if end_seconds is not None else float("inf")
-            ),
-        }]
+    ) -> list[dict[str, Any]]:
+        start = float(start_seconds or 0.0)
+        end = float("inf") if end_seconds is None else float(end_seconds)
+        duration = info_dict.get("duration")
+        covers_whole_video = start <= 0 and (
+            end == float("inf")
+            or (isinstance(duration, (int, float)) and end >= duration - 0.5)
+        )
+        if covers_whole_video:
+            return [{}]
+        return [{"start_time": start, "end_time": end}]
 
     return _ranges
 
