@@ -1,93 +1,101 @@
 # media-tools
 
-FastAPI microservice for two media jobs, built for edunavajas-hub
-(issue edunavajas/edunavajas-hub#59):
+Microservicio **FastAPI** para tres trabajos con vídeo/audio. Nace como pieza del sistema self-hosted de "[Mi Empleado Digital](https://www.youtube.com/@DevKnives)" y es el motor de transcripción que alimenta la base de conocimiento del canal.
 
-- **whisper**: index a YouTube channel with yt-dlp, download each video's
-  audio and transcribe it with the Whisper model of the Nan Builders
-  OpenAI-compatible API (or Groq's Whisper API), and consolidate everything
-  into a `channel.json`.
-- **download**: download a single video as mp4 from any yt-dlp supported
-  site (~1000+), with progress tracking.
+- **whisper** — indexa un canal de YouTube con `yt-dlp`, descarga el audio de cada vídeo y lo transcribe con un modelo Whisper (vía API compatible con OpenAI). Lo consolida todo en un `channel.json`.
+- **download** — descarga un vídeo como mp4 desde cualquier sitio soportado por `yt-dlp` (1000+), con progreso.
+- **transcript** — transcripción de una **URL suelta** desde cualquier sitio soportado por `yt-dlp`. Usa los subtítulos existentes del vídeo si los hay y, si no, cae al pipeline de Whisper. Genera `transcript.txt`, `transcript.json` y `transcript.srt`.
 
-The whisper pipeline is vendored and adapted from
-[yt-channel-whisper](https://github.com/edunavajas/yt-channel-whisper)
-(`tools/channel_index.py`, `tools/transcribe_channel.py`): CLI scripts with
-`sys.exit` were converted into exception/return-value based functions safe
-to run inside worker threads.
+El pipeline de Whisper está adaptado de **[yt-channel-whisper](https://github.com/edunavajas/yt-channel-whisper)** (`tools/channel_index.py`, `tools/transcribe_channel.py`): los scripts de CLI con `sys.exit` se convirtieron en funciones con excepciones, seguras para correr dentro de hilos de trabajo.
 
-## Layout
+---
+
+## Para qué sirve dentro de la serie
+
+En el Episodio 2 el objetivo es darle "memoria" a la documentación. Para la demo del canal, `media-tools` es el que convierte los vídeos en texto:
+
+```
+yt-channel-whisper (enumera el canal)
+        │
+        ▼
+media-tools  ──(Whisper)──▶  transcripciones
+        │
+        ▼
+Markdown con frontmatter  ──▶  n8n + pgvector  ──▶  el agente lo consulta por MCP
+```
+
+Puedes usar `media-tools` de dos formas: por su **API** (arriba) o reutilizando directamente las herramientas de `yt-channel-whisper` en local.
+
+---
+
+## Estructura
 
 ```
 app/
-├── main.py              # FastAPI app + endpoints
-├── auth.py              # bearer dependency (fail-closed)
-├── config.py            # env configuration
-├── schemas.py           # pydantic models
-├── jobs_store.py        # SQLite job store (WAL, single locked connection)
-├── workers.py           # thread pools, job runners, TTL cleaner
-├── whisper_pipeline.py  # vendored indexing/download/transcription logic
-├── downloader.py        # yt_dlp Python API download + supported sites
-└── consolidate.py       # channel.json builder
-tests/                   # pytest, fully mocked (no network)
+├── main.py              # App FastAPI + endpoints
+├── auth.py              # Dependencia bearer (fail-closed)
+├── config.py            # Configuración por entorno
+├── schemas.py           # Modelos pydantic
+├── jobs_store.py        # Store de jobs en SQLite (WAL, conexión única)
+├── workers.py           # Pools de hilos, runners de jobs, limpieza TTL
+├── whisper_pipeline.py  # Lógica de indexado/descarga/transcripción
+├── downloader.py        # Descarga con yt-dlp + sitios soportados
+├── consolidate.py       # Constructor de channel.json
+└── transcript.py        # Transcripción de una URL suelta
+tests/                   # pytest, todo mockeado (sin red)
 ```
+
+---
 
 ## API
 
-All endpoints require `Authorization: Bearer $MEDIA_TOOLS_TOKEN` except
-`GET /health`. If `MEDIA_TOOLS_TOKEN` is unset the service fails closed
-(500 on protected routes).
+Todas las rutas requieren `Authorization: Bearer $MEDIA_TOOLS_TOKEN` salvo `GET /health`. Si `MEDIA_TOOLS_TOKEN` no está definido, el servicio falla cerrado (500 en las rutas protegidas).
 
-| Endpoint | Description |
+| Endpoint | Descripción |
 |---|---|
 | `GET /health` | `{status, ytdlp_version}` |
 | `POST /jobs/whisper` | `{channel_url, language="es", max_videos?: 1-500}` → `202 {job_id}` |
-| `GET /jobs?kind=&status=` | List jobs |
-| `GET /jobs/{id}` | Job detail + progress + error |
-| `GET /jobs/{id}/download` | `channel.json` (409 running, 410 expired) |
-| `POST /download` | `{url}` (http/https only) → `202 {job_id}` |
-| `GET /download/{id}` | Download state + metadata |
-| `GET /download/{id}/file` | mp4 attachment (409 running, 410 expired) |
-| `GET /download/supported` | Curated supported-sites list |
+| `GET /jobs?kind=&status=` | Lista de jobs |
+| `GET /jobs/{id}` | Detalle + progreso + error |
+| `GET /jobs/{id}/download` | `channel.json` (409 si corre, 410 si expiró) |
+| `POST /download` | `{url}` (solo http/https) → `202 {job_id}` |
+| `GET /download/{id}` | Estado + metadatos de la descarga |
+| `GET /download/{id}/file` | mp4 como adjunto (409/410) |
+| `GET /download/supported` | Lista curada de sitios soportados |
+| `POST /transcript` | `{url, language="es"}` (solo http/https) → `202 {job_id}` |
+| `GET /transcript/{id}` | Estado + metadatos (`source: subtitles\|whisper`) |
+| `GET /transcript/{id}/file?format=srt\|txt\|json` | Fichero de transcripción (409/410) |
 
-### Job lifecycle
+### Ciclo de vida de un job
 
-`queued → running → done|failed`, and `done|failed → expired` 2h after
-`finished_at` (the cleaner runs at startup and every minute). A completed
-mp4 is deleted after its download stream reaches EOF; interrupted streams keep
-the file for the TTL safety window. Whisper exports remain available until
-that same TTL.
-On startup, jobs left in `queued|running` are marked `failed` with
-`"service restarted"`.
+`queued → running → done|failed`, y `done|failed → expired` 2 h después de `finished_at` (el limpiador corre al arrancar y cada minuto). Un mp4 completado se borra cuando su descarga llega a EOF; las descargas interrumpidas conservan el fichero hasta el TTL. Las transcripciones quedan disponibles hasta ese mismo TTL. Al arrancar, los jobs en `queued|running` se marcan como `failed` con `"service restarted"`.
 
-Whisper progress: `{total, done, failed: [{video_id,title,error}], current}`.
-Partial failures do not fail the job: failed videos appear in
-`progress.failed` and in `channel.json` with `transcript: null` + `error`.
+- **Progreso de Whisper:** `{total, done, failed: [{video_id,title,error}], current}`. Los fallos parciales no tumban el job: aparecen en `progress.failed` y en el `channel.json` como `transcript: null` + `error`.
+- **Progreso de descarga:** `{percent, downloaded_bytes, total_bytes, speed, eta, filename, metadata}`.
 
-Download progress: `{percent, downloaded_bytes, total_bytes, speed, eta,
-filename, metadata: {title, extractor, duration, filesize, thumbnail}}`.
+---
 
-## Configuration
+## Configuración
 
-See `.env.example`. Highlights:
+Ver `.env.example`. Lo importante:
 
-- `MEDIA_TOOLS_TOKEN` (required, fail-closed)
-- `TRANSCRIPTION_PROVIDER=nan` (default) or `groq`
-- `NAN_BASE_URL=https://api.nan.builders/v1`, `NAN_API_KEY` (required when
-  `TRANSCRIPTION_PROVIDER=nan`), `NAN_MODEL=whisper`, `TIMEOUT_SECONDS=1800`
-- `GROQ_API_KEY` (required when `TRANSCRIPTION_PROVIDER=groq`) and
-  `GROQ_MODEL=whisper-large-v3-turbo`
-- `DATA_DIR=/data` (SQLite `jobs.db` + job outputs)
-- `YTDLP_AUTOUPDATE=1` upgrades yt-dlp at container start (YouTube
-  extraction breaks often; the pinned version is in `requirements.txt`)
-- `YTDLP_JS_RUNTIME=deno` enables the Deno runtime used by yt-dlp EJS
-- `YTDLP_COOKIES_FILE` optionally points to a mounted Netscape-format cookies
-  file; keep it in a Coolify secret/file mount and never commit it
-- `YTDLP_PROXY` optionally configures the proxy used by both download and
-  Whisper yt-dlp calls
-- `WORKER_MODE=sync` runs jobs inline (used by the test suite)
+| Variable | Para qué |
+|---|---|
+| `MEDIA_TOOLS_TOKEN` | Bearer obligatorio. Si falta, el servicio falla cerrado. |
+| `TRANSCRIPTION_PROVIDER` | `nan` (por defecto) o `groq`. |
+| `NAN_BASE_URL`, `NAN_API_KEY`, `NAN_MODEL` | Proveedor Nan Builders (compatible con OpenAI). |
+| `GROQ_API_KEY`, `GROQ_MODEL` | Proveedor Groq (`whisper-large-v3-turbo` por defecto). |
+| `TIMEOUT_SECONDS` | Timeout por petición de transcripción (1800 por defecto). |
+| `DATA_DIR` | Directorio de datos (SQLite `jobs.db` + salidas). |
+| `YTDLP_AUTOUPDATE` | `1` actualiza `yt-dlp` al arrancar (YouTube cambia a menudo). |
+| `YTDLP_COOKIES_FILE` | Cookies de una sesión de YouTube. **Recomendado**: sin ellas, desde IPs de datacenter YouTube responde "Sign in to confirm you're not a bot". |
+| `YTDLP_PROXY` | Proxy opcional para `yt-dlp`. |
+| `YTDLP_JS_RUNTIME` | Runtime JS para resolver los retos de YouTube (`deno` viene en la imagen). |
+| `WORKER_MODE` | `sync` ejecuta los jobs en línea (solo tests). |
 
-## Run
+---
+
+## Arrancar
 
 ```bash
 python3 -m venv .venv
@@ -96,15 +104,7 @@ MEDIA_TOOLS_TOKEN=secret NAN_API_KEY=... \
   .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-Transcription defaults to Nan Builders (`NAN_BASE_URL`, `NAN_API_KEY`,
-`NAN_MODEL=whisper`) and reaches `POST /audio/transcriptions` with Bearer auth.
-To use Groq, set `TRANSCRIPTION_PROVIDER=groq`, `GROQ_API_KEY`, and optionally
-`GROQ_MODEL` in the environment before starting the service. The Groq path
-uses the official Python SDK and sends the requested language (Spanish by
-default) as `verbose_json` with segment timestamps. Audio larger than the safe
-upload threshold is converted
-with ffmpeg to a 16 kHz mono MP3 at 64 kbps and the temporary file is removed
-after the request.
+La transcripción usa Nan Builders por defecto (`NAN_BASE_URL`, `NAN_API_KEY`, `NAN_MODEL=whisper`), que alcanza `POST /audio/transcriptions` con Bearer. Para usar Groq, pon `TRANSCRIPTION_PROVIDER=groq` y `GROQ_API_KEY`.
 
 Docker:
 
@@ -115,8 +115,7 @@ docker run -p 8000:8000 -v media-tools-data:/data \
   media-tools
 ```
 
-`docker-compose.yml` runs the app alone; transcription calls the Nan
-Builders API over the network.
+---
 
 ## Tests
 
@@ -125,20 +124,18 @@ Builders API over the network.
 .venv/bin/pytest
 ```
 
-Everything is mocked (no network). `WORKER_MODE=sync` makes jobs run
-inline inside the test client.
+Todo está mockeado (sin red). `WORKER_MODE=sync` hace que los jobs corran en línea dentro del cliente de test.
 
-## Verified end-to-end
+---
 
-- Real whisper job with `max_videos=2` on NASA's public Twitch clips page
-  `https://www.twitch.tv/nasa/clips?filter=clips&range=all` (all clips
-  <= 60s) → valid `channel.json` with non-empty `transcript.text` and
-  timestamped segments.
-  Note: YouTube media downloads are bot-check blocked from datacenter
-  IPs (indexing works, `bestaudio` downloads get "Sign in to confirm
-  you're not a bot"); the job then completes with partial failures in
-  `progress.failed` and `transcript: null` entries, as designed.
-  Any yt-dlp-supported channel URL works as `channel_url`.
-- Real mp4 download of the public-domain clip
-  `https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/360/Big_Buck_Bunny_360_10s_1MB.mp4`
-  (Big Buck Bunny, 10s) → valid h264/mp4 per `ffprobe`, full metadata.
+## Verificado end-to-end
+
+- Job real de whisper con `max_videos=2` sobre una página pública de clips (`https://www.twitch.tv/nasa/clips?filter=clips&range=all`) → `channel.json` válido con `transcript.text` no vacío y segmentos con marcas de tiempo.
+  *Nota:* desde IPs de datacenter, YouTube bloquea la descarga de medios (el indexado funciona, pero `bestaudio` da "Sign in to confirm you're not a bot"). El job termina con fallos parciales en `progress.failed` y entradas `transcript: null`, como está diseñado. Cualquier URL soportada por `yt-dlp` vale como `channel_url`.
+- Descarga real de mp4 de un clip de dominio público (`test-videos.co.uk`, Big Buck Bunny, 10 s) → h264/mp4 válido según `ffprobe`, con metadatos completos.
+
+---
+
+## Licencia
+
+MIT © Eduardo Navajas
