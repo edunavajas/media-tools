@@ -1,12 +1,29 @@
 """Download job flow with a fake YoutubeDL, plus TTL expiry."""
 import asyncio
+import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import pytest
 
 from app import downloader, main, workers
 from tests.conftest import AUTH_HEADERS
 
 FAKE_FILE_BYTES = b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 2048
+
+
+@pytest.fixture(autouse=True)
+def ffprobe_reports_h264(monkeypatch):
+    """Keep the codec guard from probing fake files with a real ffprobe.
+
+    Tests that exercise the guard re-patch ``downloader.subprocess.run`` with
+    the same monkeypatch instance, which overrides this.
+    """
+
+    def fake_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 0, stdout="h264\n", stderr="")
+
+    monkeypatch.setattr(downloader.subprocess, "run", fake_run)
 
 
 class FakeYoutubeDL:
@@ -201,6 +218,74 @@ def test_ytdlp_options_are_opt_in(monkeypatch, tmp_path):
     assert captured["js_runtimes"] == {"deno": {}}
     assert captured["cookiefile"] == "/run/secrets/youtube-cookies.txt"
     assert captured["proxy"] == "http://proxy.test:8080"
+
+
+# ---------------------------------------------------------------- codec guard
+
+
+def test_format_selector_pins_h264_and_aac(monkeypatch, tmp_path):
+    monkeypatch.setattr(downloader.yt_dlp, "YoutubeDL", CapturingYoutubeDL)
+
+    downloader.download_video("https://example.com/watch?v=abc123", tmp_path)
+
+    fmt = CapturingYoutubeDL.last_opts["format"]
+    assert "avc1" in fmt
+    assert "mp4a" in fmt
+    assert "best[ext=mp4]" not in fmt
+    # no silent codec-agnostic tail: every branch pins avc1
+    assert not fmt.endswith("/best")
+    assert not fmt.endswith("/b")
+
+
+def test_non_h264_output_fails_loudly(monkeypatch, tmp_path):
+    monkeypatch.setattr(downloader.yt_dlp, "YoutubeDL", FakeYoutubeDL)
+
+    def fake_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout="av1,yuv420p\n", stderr=""
+        )
+
+    monkeypatch.setattr(downloader.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="av1"):
+        downloader.download_video("https://example.com/watch?v=abc123", tmp_path)
+
+
+def test_unvalidatable_output_fails_loudly(monkeypatch, tmp_path):
+    monkeypatch.setattr(downloader.yt_dlp, "YoutubeDL", FakeYoutubeDL)
+
+    def fake_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(
+            cmd, 1, stdout="", stderr="Invalid data found when processing input"
+        )
+
+    monkeypatch.setattr(downloader.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="could not validate"):
+        downloader.download_video("https://example.com/watch?v=abc123", tmp_path)
+
+
+def test_guard_probes_the_final_file_of_a_trim(monkeypatch, tmp_path):
+    # The ranged path stream-copies, so the guard must run on the trimmed file
+    # too: the probe is reached even when download_ranges is set.
+    monkeypatch.setattr(downloader.yt_dlp, "YoutubeDL", CapturingYoutubeDL)
+    probed = []
+
+    def fake_run(cmd, **kwargs):
+        probed.append(cmd[-1])
+        return subprocess.CompletedProcess(cmd, 0, stdout="h264\n", stderr="")
+
+    monkeypatch.setattr(downloader.subprocess, "run", fake_run)
+
+    path, _ = downloader.download_video(
+        "https://example.com/watch?v=abc123",
+        tmp_path,
+        start_seconds=2.0,
+        end_seconds=8.0,
+    )
+
+    assert "download_ranges" in CapturingYoutubeDL.last_opts
+    assert probed == [str(path)]
 
 
 # ---------------------------------------------------------------- probe

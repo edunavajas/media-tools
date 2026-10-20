@@ -1,5 +1,6 @@
 """Video download via the yt_dlp Python API, plus the supported-sites list."""
 import logging
+import subprocess
 import time
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -10,7 +11,10 @@ from app import config
 
 logger = logging.getLogger(__name__)
 
-DOWNLOAD_FORMAT = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+# ext=mp4 does not filter codecs: YouTube serves AV1 inside MP4, which Premiere
+# Pro cannot decode. Pin avc1/mp4a; H.264 tops out at 1080p so 4K now yields
+# 1080p, and a video with no H.264 format fails instead of silently giving AV1.
+DOWNLOAD_FORMAT = "bv*[vcodec^=avc1]+ba[acodec^=mp4a]/b[vcodec^=avc1]"
 
 SUPPORTED_SITES: list[dict[str, Any]] = [
     {"name": "YouTube", "domains": ["youtube.com", "youtu.be"]},
@@ -79,6 +83,43 @@ def _download_ranges(
         return [{"start_time": start, "end_time": end}]
 
     return _ranges
+
+
+def _assert_h264_video(path: Path) -> None:
+    """Fail closed unless ffprobe reports the video stream as h264.
+
+    The format selector asks for avc1, but the produced file is the contract
+    with Premiere Pro: exit code alone is useless (a valid AV1 file exits 0) and
+    a corrupt file exits 1 with empty stdout, so both must be checked.
+    """
+    result = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_name",
+            "-of",
+            "csv=p=0",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"could not validate downloaded file {path}: ffprobe exited "
+            f"{result.returncode}: {result.stderr.strip()}"
+        )
+    codec = result.stdout.strip()
+    if codec != "h264":
+        raise RuntimeError(
+            f"unsupported video codec {codec!r}: expected h264 "
+            "(Premiere Pro cannot decode AV1/VP9)"
+        )
 
 
 def download_video(
@@ -195,6 +236,10 @@ def download_video(
             final_path = mp4s[0]
     if final_path is None:
         raise RuntimeError("download finished but no mp4 file was produced")
+
+    # Covers the full download and the trim path alike: download_ranges
+    # stream-copies, so a wrong-codec source survives the trim untouched.
+    _assert_h264_video(final_path)
 
     # Some extractors (e.g. generic) report no filesize; stat the file.
     if metadata.get("filesize") is None:
