@@ -229,12 +229,94 @@ def test_format_selector_pins_h264_and_aac(monkeypatch, tmp_path):
     downloader.download_video("https://example.com/watch?v=abc123", tmp_path)
 
     fmt = CapturingYoutubeDL.last_opts["format"]
-    assert "avc1" in fmt
-    assert "mp4a" in fmt
+    # Both H.264 label spellings: YouTube reports "avc1", TikTok "h264".
+    assert "bv*[vcodec^=avc1]+ba[acodec^=mp4a]" in fmt
+    assert "bv*[vcodec^=h264]+ba[acodec^=aac]" in fmt
+    assert "b[vcodec^=avc1]" in fmt
+    assert "b[vcodec^=h264]" in fmt
     assert "best[ext=mp4]" not in fmt
-    # no silent codec-agnostic tail: every branch pins avc1
+    # no silent codec-agnostic tail: every branch pins a codec
     assert not fmt.endswith("/best")
     assert not fmt.endswith("/b")
+
+
+class FormatUnavailableThenOkYoutubeDL(FakeYoutubeDL):
+    """Fails once with the pinned format, succeeds with the fallback."""
+
+    instances: list["FormatUnavailableThenOkYoutubeDL"] = []
+
+    def __init__(self, opts):
+        super().__init__(opts)
+        self.opts = opts
+        FormatUnavailableThenOkYoutubeDL.instances.append(self)
+
+    def extract_info(self, url, download=True):
+        if self.opts["format"] != downloader.FALLBACK_FORMAT:
+            raise downloader.yt_dlp.utils.DownloadError(
+                "ERROR: [TikTok] 123: Requested format is not available. "
+                "Use --list-formats for a list of available formats"
+            )
+        return super().extract_info(url, download=True)
+
+
+def test_format_unavailable_retries_with_permissive_format(monkeypatch, tmp_path):
+    # TikTok labels H.264 as "h264", so a "no avc1" failure must not kill the
+    # job: one codec-agnostic retry recovers it (regression: prod outage).
+    FormatUnavailableThenOkYoutubeDL.instances = []
+    monkeypatch.setattr(
+        downloader.yt_dlp, "YoutubeDL", FormatUnavailableThenOkYoutubeDL
+    )
+
+    path, metadata = downloader.download_video(
+        "https://example.com/watch?v=abc123", tmp_path
+    )
+
+    assert metadata["title"] == "Fake video"
+    formats = [i.opts["format"] for i in FormatUnavailableThenOkYoutubeDL.instances]
+    assert formats == [downloader.DOWNLOAD_FORMAT, downloader.FALLBACK_FORMAT]
+    # the retry keeps trim/range options
+    assert "download_ranges" not in FormatUnavailableThenOkYoutubeDL.instances[1].opts
+
+
+def test_format_unavailable_retry_keeps_trim_options(monkeypatch, tmp_path):
+    FormatUnavailableThenOkYoutubeDL.instances = []
+    monkeypatch.setattr(
+        downloader.yt_dlp, "YoutubeDL", FormatUnavailableThenOkYoutubeDL
+    )
+
+    downloader.download_video(
+        "https://example.com/watch?v=abc123",
+        tmp_path,
+        start_seconds=2.0,
+        end_seconds=8.0,
+    )
+
+    retry_opts = FormatUnavailableThenOkYoutubeDL.instances[1].opts
+    assert "download_ranges" in retry_opts
+    assert "[trim-00-00-02-00-00-08]" in retry_opts["outtmpl"]
+
+
+def test_other_download_errors_do_not_retry(monkeypatch, tmp_path):
+    # Only the "format not available" class retries; everything else fails
+    # immediately with the original message.
+    calls = []
+
+    class OtherErrorYoutubeDL(FakeYoutubeDL):
+        def __init__(self, opts):
+            super().__init__(opts)
+            calls.append(opts["format"])
+
+        def extract_info(self, url, download=True):
+            raise downloader.yt_dlp.utils.DownloadError(
+                "ERROR: [youtube] abc: Sign in to confirm you're not a bot"
+            )
+
+    monkeypatch.setattr(downloader.yt_dlp, "YoutubeDL", OtherErrorYoutubeDL)
+
+    with pytest.raises(RuntimeError, match="Sign in to confirm"):
+        downloader.download_video("https://example.com/watch?v=abc123", tmp_path)
+
+    assert calls == [downloader.DOWNLOAD_FORMAT]
 
 
 def test_non_h264_output_fails_loudly(monkeypatch, tmp_path):

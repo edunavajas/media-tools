@@ -12,9 +12,23 @@ from app import config
 logger = logging.getLogger(__name__)
 
 # ext=mp4 does not filter codecs: YouTube serves AV1 inside MP4, which Premiere
-# Pro cannot decode. Pin avc1/mp4a; H.264 tops out at 1080p so 4K now yields
+# Pro cannot decode. Pin H.264/AAC; H.264 tops out at 1080p so 4K now yields
 # 1080p, and a video with no H.264 format fails instead of silently giving AV1.
-DOWNLOAD_FORMAT = "bv*[vcodec^=avc1]+ba[acodec^=mp4a]/b[vcodec^=avc1]"
+# Extractors label H.264 inconsistently (YouTube: "avc1", TikTok: "h264"), so
+# both tags must be tried before giving up — commit 983400b broke TikTok by
+# matching "avc1" only (prod: "Requested format is not available").
+DOWNLOAD_FORMAT = (
+    "bv*[vcodec^=avc1]+ba[acodec^=mp4a]"
+    "/bv*[vcodec^=h264]+ba[acodec^=aac]"
+    "/b[vcodec^=avc1]"
+    "/b[vcodec^=h264]"
+)
+# Last-resort selector used only when the pinned branches match nothing: some
+# extractors report vcodec=None for H.264 streams, which the labels above
+# cannot see. _assert_h264_video still rejects the file if it is not really
+# H.264, so this never delivers AV1/VP9 to Premiere.
+FALLBACK_FORMAT = "bv*+ba/b"
+FORMAT_UNAVAILABLE_MARKER = "Requested format is not available"
 
 SUPPORTED_SITES: list[dict[str, Any]] = [
     {"name": "YouTube", "domains": ["youtube.com", "youtu.be"]},
@@ -215,7 +229,23 @@ def download_video(
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
     except yt_dlp.utils.DownloadError as e:
-        raise RuntimeError(f"yt-dlp download failed: {e}") from e
+        if FORMAT_UNAVAILABLE_MARKER not in str(e):
+            raise RuntimeError(f"yt-dlp download failed: {e}") from e
+        # The pinned codec branches matched no format. Retry codec-agnostic
+        # once: either the stream really lacks H.264 (the ffprobe guard below
+        # then fails the job with a clear codec error) or the extractor
+        # mislabeled the codecs and this recovers the download.
+        logger.warning(
+            f"pinned H.264 format unavailable for {url}; "
+            "retrying with best available codec"
+        )
+        try:
+            with yt_dlp.YoutubeDL({**ydl_opts, "format": FALLBACK_FORMAT}) as ydl:
+                info = ydl.extract_info(url, download=True)
+        except yt_dlp.utils.DownloadError as retry_exc:
+            raise RuntimeError(
+                f"yt-dlp download failed: {retry_exc}"
+            ) from retry_exc
 
     if info is None:
         raise RuntimeError("yt-dlp returned no info for the URL")
